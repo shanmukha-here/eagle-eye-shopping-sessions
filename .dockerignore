@@ -1,6 +1,5 @@
 *
-!Dockerfile
-!requirements.txt
-!run.sh
-!pipeline/
-!pipeline/*.py
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/*.rs

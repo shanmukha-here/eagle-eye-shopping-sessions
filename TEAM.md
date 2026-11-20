@@ -1,3 +1,3 @@
 # Eagle Eye
 
-Engine: DuckDB and Polars on CPU.
+Engine: native Rust with Apache Parquet.

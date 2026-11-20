@@ -1,23 +1,10 @@
-# Shopping Sessions, derived from the DuckDB starter.
-# The scorers are linux/amd64 (Intel Xeon). They build this file natively, so
-# no FROM line pins a platform: `make build` builds for linux/amd64 anywhere.
-FROM python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
-
-# The scorer runs the container as uid 1000; give that uid a name and a home.
-RUN useradd --uid 1000 --no-create-home --home-dir /scratch app
-
-COPY requirements.txt /app/requirements.txt
-RUN pip install --only-binary=:all: --index-url https://pypi.org/simple --no-cache-dir -r /app/requirements.txt
-
-COPY pipeline/ /app/pipeline/
-COPY run.sh /app/run.sh
-RUN chmod +x /app/run.sh
-
-# At run time the root filesystem is read-only, the user is 1000:1000, there is
-# no network, /data is read-only, and /output and /scratch are the only writable
-# places. run.sh points every temp and cache directory at /scratch.
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-WORKDIR /app
-CMD ["/app/run.sh"]
+FROM rust:1.85.0-slim-bookworm@sha256:1829c432be4a592f3021501334d3fcca24f238432b13306a4e62669dec538e52 AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C target-feature=+crt-static"
+RUN cargo build -j 4 --release --locked --target x86_64-unknown-linux-gnu && strip target/x86_64-unknown-linux-gnu/release/shopping-sessions
+FROM scratch
+COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/shopping-sessions /shopping-sessions
+USER 1000:1000
+ENTRYPOINT ["/shopping-sessions"]

@@ -1,5 +1,7 @@
 # Shopping Sessions
 
-Eagle Eye's CPU pipeline reads the event, click and identity-link CSVs from the mounted dataset and writes two daily Parquet tables. It uses Polars to validate physical CSV lines and partition IDs. DuckDB selects event winners, groups linked people into sessions and aggregates credit and seven-day assists.
+This Rust pipeline reads the mounted shopping events, ad clicks and identity links and writes the two daily Parquet tables. Its CSV reader splits immutable memory mappings at newline boundaries and checks each physical record before decoding it.
 
-Build the top-level Dockerfile for linux/amd64. The default command reads `DATA_DIR` (default `/data`), writes `OUTPUT_DIR` (default `/output`) and creates its temporary files under `SCRATCH_DIR` (default `/scratch`). Output and scratch must be writable by UID 1000. `NCPU` and `MEM_GB` configure the worker count and memory budget.
+A union-find joins linked IDs and retains each component's smallest name. Event-ID partitions keep the earliest ingested copy, even when it is invalid. A second partition by canonical person keeps the full event and click timeline together. A sliding window counts distinct assisting campaigns and resolves last-click credit. Each worker writes its user rows directly to Parquet. Campaign totals are combined across workers.
+
+Build the Dockerfile for linux/amd64. The final image contains one statically linked x86-64-v3 executable. It reads `DATA_DIR` (default `/data`), writes `OUTPUT_DIR` (default `/output`), and uses `NCPU` worker threads (default 8). The output directory must be writable by UID 1000.

@@ -355,7 +355,14 @@ fn send(row: Payload, part: &Part, out: &mut [Vec<Event>]) {
     });
 }
 
-fn reduce(parts: Vec<Part>, out: &mut [Vec<Event>], origin: i64, bits_per_row: usize) {
+fn reduce(
+    parts: Vec<Part>,
+    out: &mut [Vec<Event>],
+    scratch: &mut Vec<u64>,
+    origin: i64,
+    bits_per_row: usize,
+    reuse: bool,
+) {
     let n = parts.iter().map(|p| p.len()).sum::<usize>();
     let bits = (n * bits_per_row).max(64).next_power_of_two();
     let mut seen = vec![0u64; bits / 64];
@@ -394,6 +401,13 @@ fn reduce(parts: Vec<Part>, out: &mut [Vec<Event>], origin: i64, bits_per_row: u
     for (which, row, _) in copies.into_values() {
         send(row, &parts[which], out);
     }
+    if reuse {
+        for part in parts {
+            if part.ids.capacity() > scratch.capacity() {
+                *scratch = part.ids;
+            }
+        }
+    }
 }
 
 pub(crate) fn pipeline(
@@ -425,6 +439,7 @@ pub(crate) fn pipeline(
         .next_power_of_two();
     let divisor = setting("SHOPPING_DENSE_DIVISOR", 768).clamp(16, 4096);
     let combine = setting("SHOPPING_SW_COMBINE", 0).min(2);
+    let reuse = setting("SHOPPING_REUSE_SCRATCH", 0) != 0;
     let bits = setting("SHOPPING_DEDUP_BITS", 16).clamp(2, 64);
     let cache = setting("SHOPPING_NAME_CACHE", 0).min(4096);
     let cache = if cache == 0 {
@@ -525,28 +540,43 @@ pub(crate) fn pipeline(
         click_input.release();
     });
     stage("compact_scan");
-    let winner_lanes = jobs(
+    let reducers = jobs(
         parts,
         threads,
-        |_| super::columns(shards),
-        |out, part| reduce(part, out, start, bits),
+        |_| (super::columns(shards), Vec::new()),
+        |(winners, scratch), part| {
+            reduce(part, winners, scratch, start, bits, reuse);
+        },
     );
     release.join().unwrap();
     stage("compact_dedup_route");
+    let (winner_lanes, recycled): (Vec<_>, Vec<_>) = reducers.into_iter().unzip();
     let work = transpose(winner_lanes, shards)
         .into_iter()
         .zip(transpose(click_lanes, shards))
-        .enumerate()
+        .collect();
+    let recycled: Vec<_> = recycled
+        .into_iter()
+        .map(|buf| Mutex::new(Some(buf)))
         .collect();
     let count = people.count().div_ceil(shards);
     let partial = input::jobs_finish(
         work,
         threads,
-        |_| Totals::new(catalog.categories.len(), catalog.channels.len(), start, end),
-        |totals, (_, (events, clicks))| {
-            totals.partition_dense(&keys, &people, events, clicks, shards, count);
+        |thread| {
+            let backing = recycled
+                .get(thread)
+                .and_then(|v| v.lock().unwrap().take())
+                .unwrap_or_default();
+            (
+                Totals::new(catalog.categories.len(), catalog.channels.len(), start, end),
+                crate::aggregate::DenseScratch::new(backing, reuse),
+            )
         },
-        |i, totals| {
+        |(totals, scratch), (events, clicks)| {
+            totals.partition_dense(&keys, &people, events, clicks, shards, count, scratch);
+        },
+        |i, (totals, _)| {
             output::users(
                 &out.join(format!("user_daily/part-{i}.parquet")),
                 &totals.users,

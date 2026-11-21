@@ -179,6 +179,23 @@ struct Touch {
     campaign: u32,
 }
 
+pub(crate) struct DenseScratch {
+    index: Vec<u32>,
+    es: Vec<u64>,
+    cs: Vec<Touch>,
+    reuse: bool,
+}
+impl DenseScratch {
+    pub(crate) fn new(es: Vec<u64>, reuse: bool) -> Self {
+        Self {
+            index: Vec::new(),
+            es,
+            cs: Vec::new(),
+            reuse,
+        }
+    }
+}
+
 impl Totals {
     pub fn new(cats: usize, camps: usize, start: i64, end: i64) -> Self {
         let base_day = start.div_euclid(DAY) as i32;
@@ -335,12 +352,19 @@ impl Totals {
         mut clicks: Vec<Vec<Click>>,
         shards: usize,
         max_people: usize,
+        scratch: &mut DenseScratch,
     ) {
         let n = events.iter().map(Vec::len).sum();
         if n == 0 {
             return;
         }
-        let mut index = vec![0u32; max_people];
+        let mut index = if scratch.reuse {
+            let mut index = std::mem::take(&mut scratch.index);
+            index.resize(max_people, 0);
+            index
+        } else {
+            vec![0u32; max_people]
+        };
         let mut groups = Vec::<(u32, usize, usize)>::new();
         let shift = shards.trailing_zeros();
         for event in events.iter_mut().flatten() {
@@ -367,21 +391,60 @@ impl Totals {
             eoff += ne;
             coff += nc;
         }
-        let mut es = vec![0u64; n];
-        let mut cs = vec![Touch::default(); coff];
-        for event in events.into_iter().flatten() {
-            let at = &mut groups[event.person as usize].1;
-            es[*at] = u64::from(event.ts) << 32 | u64::from(event.purchase);
-            *at += 1;
-        }
-        for click in clicks.into_iter().flatten().filter(|c| c.u != 0) {
-            let at = &mut groups[click.u as usize - 1].2;
-            cs[*at] = Touch {
-                t: click.t,
-                id: click.id,
-                campaign: click.campaign,
-            };
-            *at += 1;
+        let mut es = if scratch.reuse {
+            std::mem::take(&mut scratch.es)
+        } else {
+            Vec::new()
+        };
+        let mut cs = if scratch.reuse {
+            std::mem::take(&mut scratch.cs)
+        } else {
+            Vec::new()
+        };
+        es.clear();
+        cs.clear();
+        if scratch.reuse {
+            es.reserve(n);
+            cs.reserve(coff);
+            let write_events = &mut es.spare_capacity_mut()[..n];
+            let write_clicks = &mut cs.spare_capacity_mut()[..coff];
+            for event in events.into_iter().flatten() {
+                let at = &mut groups[event.person as usize].1;
+                write_events[*at].write(u64::from(event.ts) << 32 | u64::from(event.purchase));
+                *at += 1;
+            }
+            for click in clicks.into_iter().flatten().filter(|c| c.u != 0) {
+                let at = &mut groups[click.u as usize - 1].2;
+                write_clicks[*at].write(Touch {
+                    t: click.t,
+                    id: click.id,
+                    campaign: click.campaign,
+                });
+                *at += 1;
+            }
+            // The exact prefix counts cover n and coff slots, respectively.
+            // Each input consumed below was counted once in the matching group.
+            unsafe {
+                es.set_len(n);
+                cs.set_len(coff);
+            }
+        } else {
+            es.resize(n, 0);
+            cs.resize(coff, Touch::default());
+            for event in events.into_iter().flatten() {
+                let at = &mut groups[event.person as usize].1;
+                es[*at] = u64::from(event.ts) << 32 | u64::from(event.purchase);
+                *at += 1;
+            }
+            for click in clicks.into_iter().flatten().filter(|c| c.u != 0) {
+                let at = &mut groups[click.u as usize - 1].2;
+                cs[*at] = Touch {
+                    t: click.t,
+                    id: click.id,
+                    campaign: click.campaign,
+                };
+                *at += 1;
+            }
         }
         let (mut e, mut c) = (0, 0);
         for (person, end_e, end_c) in groups {
@@ -390,8 +453,16 @@ impl Totals {
             events.sort_unstable();
             clicks.sort_unstable_by_key(|x| x.t);
             self.person(keys, people.key(person), events, clicks);
+            if scratch.reuse {
+                index[(person >> shift) as usize] = 0;
+            }
             e = end_e;
             c = end_c;
+        }
+        if scratch.reuse {
+            scratch.index = index;
+            scratch.es = es;
+            scratch.cs = cs;
         }
     }
 

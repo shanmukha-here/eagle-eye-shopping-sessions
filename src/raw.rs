@@ -105,6 +105,38 @@ unsafe fn id_field(p: Ptr, delimiter: u8, key: &mut u64, encode: bool) -> Ptr {
 }
 
 #[inline(always)]
+unsafe fn two_ids<const FIRST: bool, const SECOND: bool>(
+    p: Ptr,
+    end_field: u8,
+    first: &mut u64,
+    second: &mut u64,
+) -> Ptr {
+    unsafe {
+        if p.add(9).read() == b',' && p.add(19).read() == end_field {
+            let raw = _mm256_loadu_si256(p.cast());
+            let ordinary =
+                _mm256_movemask_epi8(_mm256_cmpgt_epi8(raw, _mm256_set1_epi8(b'/' as i8)));
+            const ID_BYTES: i32 = 0x1ff | (0x1ff << 10);
+            if ordinary & ID_BYTES == ID_BYTES {
+                if FIRST {
+                    *first = word(p).swap_bytes() | pack_ninth(p.add(8).read());
+                }
+                if SECOND {
+                    *second = word(p.add(10)).swap_bytes() | pack_ninth(p.add(18).read());
+                }
+                return p.add(20);
+            }
+        }
+        let right = id_field(p, b',', first, FIRST);
+        if right.is_null() {
+            right
+        } else {
+            id_field(right, end_field, second, SECOND)
+        }
+    }
+}
+
+#[inline(always)]
 unsafe fn suffix(field: Ptr, width: usize, quotes: usize, delimiter: u8) -> Ptr {
     unsafe {
         let at = field.add(width);
@@ -328,11 +360,13 @@ unsafe fn event<const LEVEL: usize, T: EventTime>(
 ) -> bool {
     unsafe {
         let (mut id, mut user) = (0, 0);
-        let u = id_field(p, b',', &mut id, LEVEL >= 2);
-        if u.is_null() {
-            return false;
-        }
-        let clock = id_field(u, b',', &mut user, LEVEL >= 3);
+        let clock = if LEVEL == 1 {
+            two_ids::<false, false>(p, b',', &mut id, &mut user)
+        } else if LEVEL == 2 {
+            two_ids::<true, false>(p, b',', &mut id, &mut user)
+        } else {
+            two_ids::<true, true>(p, b',', &mut id, &mut user)
+        };
         if clock.is_null() {
             return false;
         }
@@ -448,11 +482,7 @@ unsafe fn click(
 ) -> bool {
     unsafe {
         let (mut id, mut user) = (0, 0);
-        let next = id_field(p, b',', &mut id, true);
-        if next.is_null() {
-            return false;
-        }
-        let campaign = id_field(next, b',', &mut user, true);
+        let campaign = two_ids::<true, true>(p, b',', &mut id, &mut user);
         if campaign.is_null() {
             return false;
         }
@@ -583,8 +613,7 @@ unsafe fn link_loop(data: &[u8], keys: &Keys, pair: &mut impl FnMut(u64, u64)) {
             let next = end.add(usize::from(end < limit));
             if limit.offset_from(p) >= 128 && end.offset_from(p) >= 17 {
                 let (mut a, mut b) = (0, 0);
-                let right = id_field(p, b',', &mut a, true);
-                if !right.is_null() && id_field(right, b'\n', &mut b, true) == next {
+                if two_ids::<true, true>(p, b'\n', &mut a, &mut b) == next {
                     pair(a, b);
                     p = next;
                     continue;

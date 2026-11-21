@@ -456,6 +456,20 @@ impl Part {
         }
     }
 
+    fn payload(&self, index: usize) -> Payload {
+        if let Some(frames) = &self.frames {
+            let (frame, offset) = (index / 16, index % 16);
+            return frames.output.get(frame).unwrap_or(&frames.pending).rows[offset];
+        }
+        if let Some(part) = &self.arena {
+            if index < part.used {
+                return part.split().1[index];
+            }
+            return self.rows[index - part.used];
+        }
+        self.rows[index]
+    }
+
     fn keys_and_rows(&self) -> impl Iterator<Item = (Key, Payload)> + '_ {
         let (keys, rows) = self
             .arena
@@ -593,6 +607,61 @@ fn send(row: Payload, part: &Part, out: &mut [Output<Event, 16>]) {
     });
 }
 
+#[derive(Clone, Copy, Default)]
+struct CopySlot {
+    key: Key,
+    lane: u32,
+    row: u32,
+}
+
+// Load is at most one half. Full-key comparisons keep this reducer exact
+// even when every event falls in the same low hash prefix.
+fn reduce_direct(
+    parts: &[Part],
+    out: &mut [Output<Event, 16>],
+    table: &mut Vec<CopySlot>,
+    origin: i64,
+) {
+    let count = parts.iter().map(Part::len).sum::<usize>();
+    if count == 0 {
+        return;
+    }
+    let cap = (count * 2).next_power_of_two();
+    table.resize(cap, CopySlot::default());
+    let mask = cap - 1;
+    let bias = origin / 1000 - ARRIVAL_BIAS;
+    let ingest = |row: Payload, part: &Part| {
+        arrival(row, part) + if row.arrival & SIDE == 0 { bias } else { 0 }
+    };
+    for (lane, part) in parts.iter().enumerate() {
+        for (row, (key, new)) in part.keys_and_rows().enumerate() {
+            let mut i = (key >> 20) as usize & mask;
+            while table[i].key != 0 && table[i].key != key {
+                i = (i + 1) & mask;
+            }
+            let slot = &mut table[i];
+            if slot.key == key {
+                let current = &parts[slot.lane as usize];
+                if ingest(new, part) >= ingest(current.payload(slot.row as usize), current) {
+                    continue;
+                }
+            }
+            *slot = CopySlot {
+                key,
+                lane: lane as u32,
+                row: row as u32,
+            };
+        }
+    }
+    for slot in table {
+        if slot.key != 0 {
+            let part = &parts[slot.lane as usize];
+            send(part.payload(slot.row as usize), part, out);
+            slot.key = 0;
+        }
+    }
+}
+
 fn reduce(
     parts: Vec<Part>,
     out: &mut [Output<Event, 16>],
@@ -681,6 +750,7 @@ pub(crate) fn pipeline(
     let arena = setting("SHOPPING_PARSE_ARENA", 0).min(2);
     let backing = setting("SHOPPING_ARENA_DIVISOR", 64).clamp(32, 128);
     let reuse = setting("SHOPPING_REUSE_SCRATCH", 0) != 0;
+    let direct = setting("SHOPPING_DEDUP_DIRECT", 0) != 0;
     let bits = setting("SHOPPING_DEDUP_BITS", 16).clamp(2, 64);
     let cache = setting("SHOPPING_NAME_CACHE", 0).min(4096);
     let cache = if cache == 0 {
@@ -817,17 +887,21 @@ pub(crate) fn pipeline(
                 (0..shards)
                     .map(|_| Output::<Event, 16>::new(combine_out, fast))
                     .collect::<Vec<_>>(),
-                Vec::new(),
+                (Vec::new(), Vec::new()),
             )
         },
-        |(winners, scratch), part| {
-            reduce(part, winners, scratch, start, bits, reuse);
+        |(winners, (scratch, table)), part| {
+            if direct {
+                reduce_direct(&part, winners, table, start);
+            } else {
+                reduce(part, winners, scratch, start, bits, reuse);
+            }
         },
         |_, lane| {
             if combine_out == 2 && fast {
                 unsafe { std::arch::x86_64::_mm_sfence() };
             }
-            lane
+            (lane.0, lane.1.0)
         },
     );
     release.join().unwrap();

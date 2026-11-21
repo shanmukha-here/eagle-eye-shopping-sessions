@@ -20,10 +20,15 @@ struct Overflow {
     names: Vec<Key>,
 }
 
+#[repr(C)]
+struct Slot {
+    key: AtomicU64,
+    root: u32,
+    padding: u32,
+}
+
 pub(crate) struct DensePeople {
-    // A new non-alias owns its slot. Linked keys know the exact root slot.
-    table: Vec<AtomicU64>,
-    roots: Vec<u32>,
+    slots: memmap2::MmapMut,
     overflow: Mutex<Overflow>,
 }
 impl DensePeople {
@@ -32,9 +37,10 @@ impl DensePeople {
         let n = (bytes / divisor + entries * 4 + 16)
             .next_power_of_two()
             .min(1 << 25);
+        let slots = memmap2::MmapMut::map_anon(n * std::mem::size_of::<Slot>()).unwrap();
+        let _ = slots.advise(memmap2::Advice::HugePage);
         let mut people = Self {
-            table: (0..n).map(|_| AtomicU64::new(0)).collect(),
-            roots: vec![0; n],
+            slots,
             overflow: Mutex::default(),
         };
         for (_, root) in original.entries() {
@@ -43,20 +49,35 @@ impl DensePeople {
         for (alias, root) in original.entries() {
             let id = people.index(alias) as usize;
             let root = people.index(root);
-            if let Some(target) = people.roots.get_mut(id) {
-                *target = root + 1;
+            if id < people.table().len() {
+                // Construction has exclusive access. All later root reads
+                // happen after workers receive this finished table.
+                unsafe { (&mut *people.slots.as_mut_ptr().cast::<Slot>().add(id)).root = root + 1 };
             }
         }
         people
     }
 
+    #[inline(always)]
+    fn table(&self) -> &[Slot] {
+        // The arena is page-aligned and zero is valid for every Slot field.
+        // Concurrent key insertions use the AtomicU64 field.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.slots.as_ptr().cast(),
+                self.slots.len() / std::mem::size_of::<Slot>(),
+            )
+        }
+    }
+
     #[inline]
     fn index(&self, key: Key) -> u32 {
         debug_assert_ne!(key, 0);
-        let mask = self.table.len() - 1;
+        let table = self.table();
+        let mask = table.len() - 1;
         let mut idx = key as usize & mask;
         for _ in 0..128 {
-            let entry = &self.table[idx];
+            let entry = &table[idx].key;
             let old = entry.load(Relaxed);
             if old == key {
                 return idx as u32;
@@ -74,7 +95,7 @@ impl DensePeople {
         if let Some(&idx) = spill.ids.get(&key) {
             return idx;
         }
-        let idx = (self.table.len() + spill.names.len()) as u32;
+        let idx = (self.table().len() + spill.names.len()) as u32;
         spill.ids.insert(key, idx);
         spill.names.push(key);
         idx
@@ -83,8 +104,8 @@ impl DensePeople {
     #[inline]
     fn person(&self, key: Key, aliases: &Aliases) -> u32 {
         let id = self.index(key);
-        if let Some(&root) = self.roots.get(id as usize) {
-            return if root == 0 { id } else { root - 1 };
+        if let Some(slot) = self.table().get(id as usize) {
+            return if slot.root == 0 { id } else { slot.root - 1 };
         }
         // Rare clustered identifiers can overflow the fixed slot array.
         self.index(aliases.canonical(key))
@@ -92,16 +113,16 @@ impl DensePeople {
 
     pub(crate) fn key(&self, person: u32) -> Key {
         let i = person as usize;
-        let mixed = if let Some(k) = self.table.get(i) {
-            k.load(Relaxed)
+        let mixed = if let Some(k) = self.table().get(i) {
+            k.key.load(Relaxed)
         } else {
-            self.overflow.lock().unwrap().names[i - self.table.len()]
+            self.overflow.lock().unwrap().names[i - self.table().len()]
         };
         keys::unmix(mixed)
     }
 
     fn count(&self) -> usize {
-        self.table.len() + self.overflow.lock().unwrap().names.len()
+        self.table().len() + self.overflow.lock().unwrap().names.len()
     }
 }
 
@@ -292,9 +313,9 @@ impl EventSink<u32> for Emitter<'_> {
     #[inline(always)]
     fn prefetch_user(&self, key: Key) {
         if self.prefetch {
-            let slot = key as usize & (self.people.table.len() - 1);
+            let slot = key as usize & (self.people.table().len() - 1);
             unsafe {
-                let base = self.people.table.as_ptr().add(slot);
+                let base = self.people.table().as_ptr().add(slot);
                 std::arch::x86_64::_mm_prefetch(base.cast(), std::arch::x86_64::_MM_HINT_T0);
             }
         }

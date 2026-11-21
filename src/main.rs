@@ -408,6 +408,21 @@ fn read_people(data: &Path, keys: &Keys, threads: usize, fast: bool) -> Aliases 
     people.freeze()
 }
 
+fn usage() -> (f64, f64, i64, i64, i64) {
+    let mut raw = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    let status = unsafe { libc::getrusage(libc::RUSAGE_SELF, raw.as_mut_ptr()) };
+    assert_eq!(status, 0);
+    let raw = unsafe { raw.assume_init() };
+    let seconds = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
+    (
+        seconds(raw.ru_utime),
+        seconds(raw.ru_stime),
+        raw.ru_minflt,
+        raw.ru_majflt,
+        raw.ru_maxrss,
+    )
+}
+
 fn main() {
     let data = PathBuf::from(env::var_os("DATA_DIR").unwrap_or_else(|| "/data".into()));
     let out = PathBuf::from(env::var_os("OUTPUT_DIR").unwrap_or_else(|| "/output".into()));
@@ -417,8 +432,24 @@ fn main() {
         .unwrap_or(8)
         .clamp(1, 64);
     let mut mark = Instant::now();
+    let mut last = env::var_os("SHOPPING_PHASE_USAGE").map(|_| usage());
     let stage = |name: &str| {
-        eprintln!("{name} {:.3}s", mark.elapsed().as_secs_f64());
+        let wall = mark.elapsed().as_secs_f64();
+        if let Some(before) = last {
+            let now = usage();
+            let stage = name.replace(' ', "_");
+            eprintln!(
+                "stage={stage} wall_s={wall:.6} user_s={:.6} system_s={:.6} minor={} major={} rss_kib={}",
+                now.0 - before.0,
+                now.1 - before.1,
+                now.2 - before.2,
+                now.3 - before.3,
+                now.4,
+            );
+            last = Some(now);
+        } else {
+            eprintln!("{name} {wall:.3}s");
+        }
         mark = Instant::now();
     };
     let manifest: serde_json::Value =

@@ -26,6 +26,11 @@ const fn ninth_table() -> [u64; 128] {
 }
 const NINTH: [u64; 128] = ninth_table();
 
+#[inline(always)]
+pub(super) fn pack_ninth(byte: u8) -> u64 {
+    NINTH[byte as usize]
+}
+
 #[inline]
 pub fn mix(mut k: u64) -> u64 {
     k ^= k >> 32;

@@ -5,6 +5,7 @@ mod input;
 mod keys;
 mod output;
 mod pages;
+mod raw;
 
 use aggregate::{Click, Event, SmallEvent, Stats, Stored, Totals};
 use input::{DAY, Dates, INVALID, Input, WEEK, jobs, rows};
@@ -413,15 +414,28 @@ fn pipeline<T: EventTime, E: Stored>(
         .next_power_of_two()
         .min(4096);
     let people = std::sync::OnceLock::new();
+    let clock = raw::Calendar::new(start, end);
+    let fast = raw::available() && env::var_os("SHOPPING_RAW_EVENTS").is_some();
+    let probe = env::var_os("SHOPPING_PROBE_EVENTS").is_some();
+    let level = env::var("SHOPPING_RAW_FIELD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(7);
+    let level = if probe { level } else { 7 };
     enum Scan<'a> {
         Links,
         Events(input::Chunk<'a>),
         Clicks(input::Chunk<'a>),
     }
-    let mut tasks = vec![Scan::Links];
+    let mut tasks = Vec::new();
+    if !probe {
+        tasks.push(Scan::Links);
+    }
     tasks.extend(raw.chunks().into_iter().map(Scan::Events));
     let click_input = Input::open_for_scan(&data.join("clicks"));
-    tasks.extend(click_input.chunks().into_iter().map(Scan::Clicks));
+    if !probe {
+        tasks.extend(click_input.chunks().into_iter().map(Scan::Clicks));
+    }
     let lanes = std::thread::scope(|scope| {
         let readers = threads.min(4);
         for lane in 0..readers {
@@ -447,19 +461,21 @@ fn pipeline<T: EventTime, E: Stored>(
                         .collect::<Vec<_>>(),
                     input::ReadBuffer::new(),
                     Vec::<Vec<Click>>::new(),
+                    [0usize; 2],
                 )
             },
             |s, task| match task {
                 Scan::Events(chunk) => {
-                    events(
-                        chunk.read(&mut s.2),
-                        &mut s.0,
-                        &keys,
-                        &catalog,
-                        start,
-                        end,
-                        &mut s.1,
-                    );
+                    let data = chunk.read(&mut s.2);
+                    if fast {
+                        let seen = raw::events(
+                            data, &mut s.0, &keys, &catalog, &clock, start, end, &mut s.1, level,
+                        );
+                        s.4[0] += seen[0];
+                        s.4[1] += seen[1];
+                    } else {
+                        events(data, &mut s.0, &keys, &catalog, start, end, &mut s.1);
+                    }
                 }
                 Scan::Clicks(chunk) => {
                     let mut pending = Vec::new();
@@ -497,10 +513,22 @@ fn pipeline<T: EventTime, E: Stored>(
             },
         )
     });
+    if probe {
+        stage("parse_events");
+        let hit = lanes.iter().map(|s| s.4[0]).sum::<usize>();
+        let miss = lanes.iter().map(|s| s.4[1]).sum::<usize>();
+        let rows = lanes
+            .iter()
+            .flat_map(|s| &s.1)
+            .map(|b| b.rows.len())
+            .sum::<usize>();
+        eprintln!("probe=events fast={hit} fallback={miss} emitted={rows}");
+        unsafe { libc::_exit(0) }
+    }
     let people = people.into_inner().unwrap();
     let mut parts = columns(n);
     let mut pending = Vec::new();
-    for (_, lane, _, clicks) in lanes {
+    for (_, lane, _, clicks, _) in lanes {
         pending.extend(clicks);
         for (part, bucket) in parts.iter_mut().zip(lane) {
             part.push(bucket);

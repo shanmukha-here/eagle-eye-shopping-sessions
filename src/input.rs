@@ -57,7 +57,6 @@ pub struct Input {
     read_ahead: usize,
     release_window: usize,
     step: usize,
-    populate_chunks: bool,
 }
 
 const STEP: usize = 2 << 20;
@@ -150,17 +149,9 @@ impl Input {
         } else {
             0
         };
-        let sequential = !scan || cold || std::env::var_os("SHOPPING_WARM_NORMAL_ADVICE").is_none();
-        let mapped_step = if scan && !cold {
-            mib("SHOPPING_WARM_CHUNK_MIB", 2).max(1 << 20)
-        } else {
-            STEP
-        };
         Self {
             files: mappings.into_iter().map(|(file, mapping)| {
-                if sequential {
-                    let _ = mapping.advise(memmap2::Advice::Sequential);
-                }
+                let _ = mapping.advise(memmap2::Advice::Sequential);
                 let buffered = (buffered_step != 0).then(|| {
                     unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
                     file
@@ -169,8 +160,7 @@ impl Input {
             }).collect(),
             read_ahead,
             release_window: mib("SHOPPING_RELEASE_MIB", 8),
-            step: if buffered_step == 0 { mapped_step } else { buffered_step },
-            populate_chunks: scan && !cold && std::env::var_os("SHOPPING_WARM_POPULATE").is_some(),
+            step: if buffered_step == 0 { STEP } else { buffered_step },
         }
     }
 
@@ -226,7 +216,6 @@ impl Input {
                 buffered: source.buffered.as_ref(),
                 start,
                 end: (start + self.step).min(file.len()),
-                populate: self.populate_chunks,
             })
         }).collect()
     }
@@ -238,19 +227,10 @@ pub struct Chunk<'a> {
     buffered: Option<&'a File>,
     start: usize,
     end: usize,
-    populate: bool,
 }
 impl<'a> Chunk<'a> {
     pub fn read<'b>(&'b self, buf: &'b mut ReadBuffer) -> &'b [u8] {
         use std::os::unix::fs::FileExt;
-        if self.populate {
-            // The chunk begins at a page-aligned offset inside the mapping.
-            // If the host kernel lacks this advice, scanning faults in normally.
-            let begin = unsafe { self.file.as_ptr().add(self.start) };
-            unsafe {
-                libc::madvise(begin.cast_mut().cast(), self.end - self.start, libc::MADV_POPULATE_READ);
-            }
-        }
         if let Some(fd) = self.buffered {
             let remaining = self.file.len() - self.start;
             let body = self.end - self.start;
@@ -744,7 +724,6 @@ mod tests {
                     .flat_map(|start| {
                         Chunk {
                             buffered: None,
-                            populate: false,
                             file,
                             start,
                             end: (start + step).min(file.len()),

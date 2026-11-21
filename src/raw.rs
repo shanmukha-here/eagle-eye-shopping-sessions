@@ -475,8 +475,79 @@ unsafe fn event_loop<const LEVEL: usize, T: EventTime>(
     }
 }
 
+#[inline(always)]
+unsafe fn bounded_key(p: Ptr, len: usize) -> (u64, bool) {
+    unsafe {
+        let q = usize::from(p.read() == b'"');
+        let width = len.wrapping_sub(q * 2);
+        let raw = word(p.add(q));
+        let ninth = p.add(q + 8).read();
+        let low = (raw | 0x8080808080808080).wrapping_sub(0x3030303030303030);
+        let bad = (raw | !low) & 0x8080808080808080 != 0;
+        let nine = width == 9;
+        let quotes = (q == 0) | (p.add(len.saturating_sub(1)).read() == b'"');
+        let valid = quotes
+            & ((width == 8) | nine)
+            & !bad
+            & (!nine | (ninth.wrapping_sub(b'0') <= 127 - b'0'));
+        // The ninth-byte table accepts any seven-bit value. The validation
+        // above rejects non-ASCII bytes before this key is used.
+        let extra = if nine { ninth & 127 } else { 0 };
+        (raw.swap_bytes() | pack_ninth(extra), valid)
+    }
+}
+
+#[inline(always)]
+unsafe fn event_prefix<T: EventTime>(
+    p: Ptr,
+    end: Ptr,
+    state: State<'_>,
+    out: &mut (impl EventSink<T> + ?Sized),
+) -> bool {
+    unsafe {
+        let commas = _mm256_set1_epi8(b',' as i8);
+        let head = _mm256_loadu_si256(p.cast());
+        let next = _mm256_loadu_si256(p.add(32).cast());
+        let a = _mm256_movemask_epi8(_mm256_cmpeq_epi8(head, commas)) as u32;
+        let b = _mm256_movemask_epi8(_mm256_cmpeq_epi8(next, commas)) as u32;
+        let mask = u64::from(a) | u64::from(b) << 32;
+        let first = mask.trailing_zeros() as usize;
+        let mask = mask & mask.wrapping_sub(1);
+        let second = mask.trailing_zeros() as usize;
+        let mask = mask & mask.wrapping_sub(1);
+        let third = mask.trailing_zeros() as usize;
+        if third == 64 || p.add(third) >= end {
+            return false;
+        }
+        let (id, id_ok) = bounded_key(p, first);
+        let (user, user_ok) = bounded_key(p.add(first + 1), second - first - 1);
+        let clock = p.add(second + 1);
+        let q = usize::from(clock.read() == b'"');
+        let ts = clock.add(q);
+        let len = (third - second - 1).wrapping_sub(q * 2);
+        let closed = (q == 0) | (p.add(third - 1).read() == b'"');
+        let arrival = p.add(third + 1);
+        let q = usize::from(arrival.read() == b'"');
+        let received = arrival.add(q);
+        let tail = suffix(received, 20, q, b',');
+        if !(id_ok & user_ok & closed) || tail.is_null() || tail > end {
+            return false;
+        }
+        let id = mix(id);
+        let user = mix(user);
+        out.prefetch_user(user);
+        let time = match len {
+            13 => stamp::<13>(ts, state.clock),
+            20 => stamp::<20>(ts, state.clock),
+            25 => stamp::<25>(ts, state.clock),
+            _ => return false,
+        };
+        decode_event::<7, T>(time, received, tail, end, state, id, user, out)
+    }
+}
+
 #[target_feature(enable = "avx2")]
-unsafe fn event_cursors<const N: usize, T: EventTime>(
+unsafe fn event_cursors<const N: usize, const PREFIX: bool, T: EventTime>(
     data: &[u8],
     date: &mut Dates,
     keys: &Keys,
@@ -508,7 +579,11 @@ unsafe fn event_cursors<const N: usize, T: EventTime>(
                 let following = end.add(usize::from(end < ends[i]));
                 if limit.offset_from(p) >= 128
                     && end.offset_from(p) >= 50
-                    && event::<7, T>(p, end, state, emit)
+                    && if PREFIX {
+                        event_prefix::<T>(p, end, state, emit)
+                    } else {
+                        event::<7, T>(p, end, state, emit)
+                    }
                 {
                     count[0] += 1;
                 } else {
@@ -540,10 +615,19 @@ pub(super) fn events<T: EventTime>(
     // The caller has checked AVX2. Keep the probe checkpoints consistent.
     unsafe {
         if level == 7 {
+            if std::env::var_os("SHOPPING_MASKED_PREFIX").is_some() {
+                return event_cursors::<1, true, T>(data, date, keys, catalog, state, emit);
+            }
             match std::env::var("SHOPPING_ROW_CURSORS").as_deref() {
-                Ok("1") => return event_cursors::<1, T>(data, date, keys, catalog, state, emit),
-                Ok("2") => return event_cursors::<2, T>(data, date, keys, catalog, state, emit),
-                Ok("3") => return event_cursors::<3, T>(data, date, keys, catalog, state, emit),
+                Ok("1") => {
+                    return event_cursors::<1, false, T>(data, date, keys, catalog, state, emit);
+                }
+                Ok("2") => {
+                    return event_cursors::<2, false, T>(data, date, keys, catalog, state, emit);
+                }
+                Ok("3") => {
+                    return event_cursors::<3, false, T>(data, date, keys, catalog, state, emit);
+                }
                 _ => {}
             }
         }

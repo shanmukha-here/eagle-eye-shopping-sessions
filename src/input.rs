@@ -49,43 +49,62 @@ pub fn jobs_finish<T: Send, R: Send, S: Send>(
 
 struct Source {
     mapping: Mmap,
-    direct: Option<File>,
+    buffered: Option<File>,
 }
 
-pub struct Input(Vec<Source>, bool, usize);
-// Both the starting offset and request size are multiples of a disk page.
+pub struct Input {
+    files: Vec<Source>,
+    read_ahead: usize,
+    release_window: usize,
+    step: usize,
+    populate_chunks: bool,
+}
+
 const STEP: usize = 2 << 20;
 const OVERLAP: usize = 4096;
 
-pub struct ReadBuffer(memmap2::MmapMut);
+pub struct ReadBuffer(Option<memmap2::MmapMut>);
 impl ReadBuffer {
     pub fn new() -> Self {
-        Self(memmap2::MmapMut::map_anon(STEP + OVERLAP).unwrap())
+        Self(None)
+    }
+
+    fn bytes(&mut self, size: usize) -> Option<&mut [u8]> {
+        if self.0.as_ref().is_none_or(|buf| buf.len() < size) {
+            let buf = memmap2::MmapMut::map_anon(size).ok()?;
+            let _ = buf.advise(memmap2::Advice::HugePage);
+            self.0 = Some(buf);
+        }
+        Some(&mut self.0.as_mut()?[..size])
     }
 }
 
-fn major_faults() -> Option<i64> {
-    let mut usage = std::mem::MaybeUninit::uninit();
-    // getrusage initializes the whole structure on success.
-    let rc = unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) };
-    (rc == 0).then(|| unsafe { usage.assume_init() }.ru_majflt)
+fn mib(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+        .min(64) << 20
 }
 
 fn is_cold(mapping: &Mmap) -> bool {
     if mapping.len() < STEP {
         return false;
     }
-    let Some(before) = major_faults() else {
+    // Sample distinct cache pages without faulting them in. A failed probe
+    // leaves the scan on the ordinary mapped reader.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 {
         return false;
-    };
-    // A new mapping of resident pages faults them in without disk I/O.
-    // Sample separated pages of the largest shard before issuing readahead.
-    for i in [1, 2, 3] {
-        unsafe {
-            std::ptr::read_volatile(&mapping[(mapping.len() / 4) * i]);
-        }
     }
-    major_faults().is_some_and(|after| after - before >= 2)
+    let page = page as usize;
+    [1, 2, 3].into_iter().filter(|&quarter| {
+        let offset = (mapping.len() / 4 * quarter) / page * page;
+        let mut resident = 0;
+        let ptr = unsafe { mapping.as_ptr().add(offset) };
+        let status = unsafe { libc::mincore(ptr.cast_mut().cast(), page, &mut resident) };
+        status == 0 && resident & 1 == 0
+    }).count() >= 2
 }
 
 impl Input {
@@ -97,8 +116,8 @@ impl Input {
         Self::open_mode(path, true)
     }
 
-    fn open_mode(path: &Path, sample_cache: bool) -> Self {
-        use std::os::unix::fs::OpenOptionsExt;
+    fn open_mode(path: &Path, scan: bool) -> Self {
+        use std::os::fd::AsRawFd;
         let mut paths = if path.is_dir() {
             fs::read_dir(path)
                 .unwrap()
@@ -109,126 +128,142 @@ impl Input {
             vec![path.to_owned()]
         };
         paths.sort_unstable();
-        let mut files = Vec::with_capacity(paths.len());
+        let mut mappings = Vec::with_capacity(paths.len());
         for path in paths {
-            let file = File::open(&path).unwrap();
+            let file = File::open(path).unwrap();
             if file.metadata().unwrap().len() != 0 {
                 // The scorer mounts immutable input files.
                 let mapping = unsafe { Mmap::map(&file).unwrap() };
-                files.push((path, mapping));
+                mappings.push((file, mapping));
             }
         }
-        let cold = sample_cache
-            && files
-                .iter()
-                .max_by_key(|(_, m)| m.len())
-                .is_some_and(|(_, m)| is_cold(m));
-        let direct = cold && std::env::var_os("SHOPPING_FORCE_MMAP").is_none();
-        let prefetch = cold || std::env::var_os("SHOPPING_WARM_SKIP_PREFETCH").is_none();
-        let release_window = std::env::var("SHOPPING_RELEASE_MIB").ok()
-            .and_then(|value| value.parse::<usize>().ok()).unwrap_or(8).min(64) << 20;
-        Self(
-            files
-                .into_iter()
-                .map(|(path, mapping)| {
+        let cold = scan
+            && mappings.iter().max_by_key(|(_, map)| map.len())
+                .is_some_and(|(_, map)| is_cold(map));
+        let buffered_step = if scan && (cold || std::env::var_os("SHOPPING_BUFFER_ALWAYS").is_some()) {
+            mib("SHOPPING_BUFFER_MIB", 0)
+        } else {
+            0
+        };
+        let read_ahead = if cold || std::env::var_os("SHOPPING_WARM_SKIP_PREFETCH").is_none() {
+            mib("SHOPPING_READAHEAD_MIB", 8)
+        } else {
+            0
+        };
+        let sequential = !scan || cold || std::env::var_os("SHOPPING_WARM_NORMAL_ADVICE").is_none();
+        let mapped_step = if scan && !cold {
+            mib("SHOPPING_WARM_CHUNK_MIB", 2).max(1 << 20)
+        } else {
+            STEP
+        };
+        Self {
+            files: mappings.into_iter().map(|(file, mapping)| {
+                if sequential {
                     let _ = mapping.advise(memmap2::Advice::Sequential);
-                    let direct = if direct && mapping.len() >= OVERLAP {
-                        File::options()
-                            .read(true)
-                            .custom_flags(libc::O_DIRECT)
-                            .open(path)
-                            .ok()
-                    } else {
-                        None
-                    };
-                    Source { mapping, direct }
-                })
-                .collect(),
-            prefetch,
-            release_window,
-        )
+                }
+                let buffered = (buffered_step != 0).then(|| {
+                    unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+                    file
+                });
+                Source { mapping, buffered }
+            }).collect(),
+            read_ahead,
+            release_window: mib("SHOPPING_RELEASE_MIB", 8),
+            step: if buffered_step == 0 { mapped_step } else { buffered_step },
+            populate_chunks: scan && !cold && std::env::var_os("SHOPPING_WARM_POPULATE").is_some(),
+        }
     }
+
     pub fn bytes(&self) -> usize {
-        self.0.iter().map(|s| s.mapping.len()).sum()
+        self.files.iter().map(|source| source.mapping.len()).sum()
     }
+
     pub fn release(self) {
-        // A single unmap of a large resident shard can hold the process mmap
-        // lock while other workers need it for page faults. Clear the private
-        // page-table entries in smaller ranges before the mapping is dropped.
-        let window = self.2;
-        for source in self.0 {
-            if window != 0 && source.direct.is_none() && source.mapping.len() > window {
-                for off in (0..source.mapping.len()).step_by(window) {
-                    // Data are read-only and the scanner has already joined.
+        // Clear private page-table entries in smaller ranges to limit how
+        // long the process's mapping lock is held while reducers run.
+        let window = self.release_window;
+        for source in self.files {
+            let file = &source.mapping;
+            if window != 0 && source.buffered.is_none() && file.len() > window {
+                for off in (0..file.len()).step_by(window) {
+                    // The read-only scanner has joined and cannot use this range.
                     unsafe {
-                        let _ = source.mapping.unchecked_advise_range(
-                            memmap2::UncheckedAdvice::DontNeed,
-                            off,
-                            (source.mapping.len() - off).min(window),
+                        let _ = file.unchecked_advise_range(
+                            memmap2::UncheckedAdvice::DontNeed, off, (file.len() - off).min(window),
                         );
                     }
                 }
             }
         }
     }
+
     pub fn prefetch(&self, lane: usize, lanes: usize) {
-        if !self.1 {
+        use std::os::fd::AsRawFd;
+        let window = self.read_ahead;
+        if window == 0 {
             return;
         }
-        for file in self.0.iter().skip(lane).step_by(lanes) {
-            if file.direct.is_some() {
-                continue;
-            }
-            let file = &file.mapping;
-            // Linux caps a single speculative read. Queue the file in order.
-            const WINDOW: usize = 8 << 20;
-            for off in (0..file.len()).step_by(WINDOW) {
-                let _ = file.advise_range(
-                    memmap2::Advice::WillNeed,
-                    off,
-                    (file.len() - off).min(WINDOW),
-                );
+        for source in self.files.iter().skip(lane).step_by(lanes) {
+            let file = &source.mapping;
+            for off in (0..file.len()).step_by(window) {
+                let len = (file.len() - off).min(window);
+                if let Some(fd) = &source.buffered {
+                    unsafe {
+                        libc::posix_fadvise(fd.as_raw_fd(), off as i64, len as i64, libc::POSIX_FADV_WILLNEED);
+                    }
+                } else {
+                    let _ = file.advise_range(memmap2::Advice::WillNeed, off, len);
+                }
             }
         }
     }
+
     pub fn chunks(&self) -> Vec<Chunk<'_>> {
-        self.0
-            .iter()
-            .flat_map(|source| {
-                let file = &source.mapping;
-                (0..file.len()).step_by(STEP).map(|start| Chunk {
-                    file,
-                    direct: source.direct.as_ref(),
-                    start,
-                    end: (start + STEP).min(file.len()),
-                })
+        self.files.iter().flat_map(|source| {
+            let file = &source.mapping;
+            (0..file.len()).step_by(self.step).map(|start| Chunk {
+                file,
+                buffered: source.buffered.as_ref(),
+                start,
+                end: (start + self.step).min(file.len()),
+                populate: self.populate_chunks,
             })
-            .collect()
+        }).collect()
     }
 }
 
 #[derive(Clone, Copy)]
 pub struct Chunk<'a> {
     file: &'a [u8],
-    direct: Option<&'a File>,
+    buffered: Option<&'a File>,
     start: usize,
     end: usize,
+    populate: bool,
 }
 impl<'a> Chunk<'a> {
     pub fn read<'b>(&'b self, buf: &'b mut ReadBuffer) -> &'b [u8] {
         use std::os::unix::fs::FileExt;
-        if let Some(fd) = self.direct {
+        if self.populate {
+            // The chunk begins at a page-aligned offset inside the mapping.
+            // If the host kernel lacks this advice, scanning faults in normally.
+            let begin = unsafe { self.file.as_ptr().add(self.start) };
+            unsafe {
+                libc::madvise(begin.cast_mut().cast(), self.end - self.start, libc::MADV_POPULATE_READ);
+            }
+        }
+        if let Some(fd) = self.buffered {
             let remaining = self.file.len() - self.start;
-            let wanted = remaining.min(buf.0.len());
-            if fd.read_at(&mut buf.0, self.start as u64).ok() == Some(wanted) {
-                if let Some(rows) =
-                    owned_records(&buf.0[..wanted], self.end - self.start, wanted == remaining)
-                {
-                    return rows;
+            let body = self.end - self.start;
+            let wanted = remaining.min(body + OVERLAP);
+            if let Some(bytes) = buf.bytes(wanted) {
+                if fd.read_at(bytes, self.start as u64).ok() == Some(wanted) {
+                    if let Some(rows) = owned_records(bytes, body, wanted == remaining) {
+                        return rows;
+                    }
                 }
             }
         }
-        // A short read, unsupported I/O or a long boundary row uses the mapping.
+        // A short read or a boundary row longer than the overlap uses mmap.
         self.records()
     }
 
@@ -708,7 +743,8 @@ mod tests {
                     .step_by(step)
                     .flat_map(|start| {
                         Chunk {
-                            direct: None,
+                            buffered: None,
+                            populate: false,
                             file,
                             start,
                             end: (start + step).min(file.len()),

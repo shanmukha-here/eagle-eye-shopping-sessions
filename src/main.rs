@@ -262,11 +262,12 @@ fn events<T: EventTime>(
     );
 }
 
-fn winners<T: EventTime, E: Stored>(
+fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
     parts: Vec<Bucket<T>>,
     people: &Aliases,
     out: &mut [Vec<E>],
     start: i64,
+    group: usize,
 ) {
     let count = parts.iter().map(|bin| bin.rows.len()).sum::<usize>();
     if count == 0 {
@@ -275,14 +276,20 @@ fn winners<T: EventTime, E: Stored>(
     // First find unique hash positions in a cache-resident bitmap. Only IDs
     // at repeated positions require a full-key minimum-ingest reduction.
     let bits = (count * 16).max(64).next_power_of_two();
-    let mut seen = vec![0u64; bits / 64];
-    let mut collisions = vec![0u64; bits / 64];
+    let mut seen = vec![0u64; if PAIRED_BITS { 0 } else { bits / 64 }];
+    let mut collisions = vec![0u64; bits / if PAIRED_BITS { 32 } else { 64 }];
     let index = |key: u64| (key >> 20) as usize & (bits - 1);
     for e in parts.iter().flat_map(|bin| &bin.rows) {
         let i = index(e.id);
-        let mask = 1u64 << (i % 64);
-        collisions[i / 64] |= seen[i / 64] & mask;
-        seen[i / 64] |= mask;
+        if PAIRED_BITS {
+            let first = 1u64 << (2 * (i % 32));
+            let word = &mut collisions[i / 32];
+            *word |= first | ((*word & first) << 1);
+        } else {
+            let mask = 1u64 << (i % 64);
+            collisions[i / 64] |= seen[i / 64] & mask;
+            seen[i / 64] |= mask;
+        }
     }
     let mut emit = |e: Candidate<T>, d: Detail| {
         if let Some(t) = e.t.unpack(start) {
@@ -302,7 +309,7 @@ fn winners<T: EventTime, E: Stored>(
     let mut repeated = IntMap::<(Candidate<T>, Detail)>::default();
     repeated.reserve(count / 8);
     for bin in parts {
-        for block in bin.rows.chunks(32) {
+        for block in bin.rows.chunks(group) {
             for e in block {
                 people.prefetch(e.user);
             }
@@ -317,7 +324,12 @@ fn winners<T: EventTime, E: Stored>(
                     bin.extra[(e.arrival ^ SIDE) as usize]
                 };
                 let i = index(e.id);
-                if collisions[i / 64] & (1u64 << (i % 64)) == 0 {
+                let duplicated = if PAIRED_BITS {
+                    collisions[i / 32] & (2u64 << (2 * (i % 32))) != 0
+                } else {
+                    collisions[i / 64] & (1u64 << (i % 64)) != 0
+                };
+                if !duplicated {
                     emit(e, d);
                 } else {
                     repeated
@@ -625,6 +637,9 @@ fn pipeline<T: EventTime, E: Stored>(
     }
     let mut copies = parts.into_iter();
     let mut chunks = pending.into_iter();
+    let paired_bits = env::var_os("SHOPPING_PAIRED_BITS").is_some();
+    let group = env::var("SHOPPING_PREFETCH_GROUP").ok()
+        .and_then(|value| value.parse::<usize>().ok()).unwrap_or(32).clamp(1, 128);
     let mut tasks = Vec::with_capacity(copies.len() + chunks.len());
     while copies.len() != 0 || chunks.len() != 0 {
         if let Some(part) = copies.next() {
@@ -639,9 +654,15 @@ fn pipeline<T: EventTime, E: Stored>(
         threads,
         |_| (columns(person_shards), columns(person_shards)),
         |s, task| match task {
-            Work::Copies(part) => winners::<T, E>(part, &people, &mut s.0, start),
+            Work::Copies(part) => {
+                if paired_bits {
+                    winners::<T, E, true>(part, &people, &mut s.0, start, group);
+                } else {
+                    winners::<T, E, false>(part, &people, &mut s.0, start, group);
+                }
+            }
             Work::Clicks(chunk) => {
-                for block in chunk.chunks(32) {
+                for block in chunk.chunks(group) {
                     for c in block {
                         people.prefetch(c.u);
                     }
@@ -660,7 +681,12 @@ fn pipeline<T: EventTime, E: Stored>(
     release_inputs.join().unwrap();
     drop(people);
     stage("event dedup and click routing");
-    let work = event_parts.into_iter().zip(click_parts).collect();
+    let mut work: Vec<_> = event_parts.into_iter().zip(click_parts).collect();
+    if env::var_os("SHOPPING_HEAVIEST_FIRST").is_some() {
+        work.sort_unstable_by_key(|(events, clicks)| std::cmp::Reverse(
+            events.iter().map(Vec::len).sum::<usize>() + clicks.iter().map(Vec::len).sum::<usize>(),
+        ));
+    }
     let partial = input::jobs_finish(
         work,
         threads,

@@ -41,11 +41,12 @@ if warm_model is not None:
 
 calibrate = sys.argv[1:] == ["--calibrate"]
 quick = sys.argv[1:] == ["--trial"]
+natural = sys.argv[1:] == ["--natural"]
 tuning = sys.argv[1:] == ["--tune"]
 rerank = sys.argv[1:] == ["--rerank"]
 public = sys.argv[1:] == ["--public"]
-if sys.argv[1:] and not (tuning or rerank or public or calibrate or quick):
-    sys.exit("usage: localboard.sh [--tune | --rerank | --public | --calibrate | --trial]")
+if sys.argv[1:] and not (tuning or rerank or public or calibrate or quick or natural):
+    sys.exit("usage: localboard.sh [--tune | --rerank | --public | --calibrate | --trial | --natural]")
 env = dict(os.environ, NCPU="8", MEM_GB="24", PYTHONDONTWRITEBYTECODE="1")
 cg = Path("/sys/fs/cgroup") / Path("/proc/self/cgroup").read_text().split("0::")[-1].strip().lstrip("/")
 assert len(os.sched_getaffinity(0)) == 8
@@ -211,7 +212,7 @@ def open_pidfd(pid):
     return fd
 
 
-def run(name, inp, answer, limit, allow_cutoff=False):
+def run(name, inp, answer, limit, allow_cutoff=False, cache_state=None):
     with tempfile.TemporaryDirectory(dir=data / "scratch") as tmp:
         base = Path(tmp)
         out, scratch = base / "out", base / "scratch"
@@ -220,7 +221,9 @@ def run(name, inp, answer, limit, allow_cutoff=False):
         execution = dict(env, DATA_DIR=str(inp), OUTPUT_DIR=str(out),
                          SCRATCH_DIR=str(scratch), HOME=str(scratch), TMPDIR=str(scratch))
         with command(inp, out, scratch) as (argv, container), (base / "stdout").open("wb") as stdout, (base / "stderr").open("wb") as stderr:
-            if warm_model is not None and name in ("practice", "final"):
+            if cache_state == "reuse":
+                cache = "inherited_cache"
+            elif cache_state is None and warm_model is not None and name in ("practice", "final"):
                 resident, pages = warm(inp)
                 cache = f"warm={resident}/{pages} pages"
             else:
@@ -283,14 +286,15 @@ def run(name, inp, answer, limit, allow_cutoff=False):
         return elapsed, lifecycle, used_cpu
 
 
-def dataset(name, limit, allow_cutoff=False):
-    return run(name, data/name, data/(name+"-answer"), limit, allow_cutoff)
+def dataset(name, limit, allow_cutoff=False, cache_state=None):
+    return run(name, data/name, data/(name+"-answer"), limit, allow_cutoff, cache_state)
 
 
 def predict(times):
     if warm_model is not None:
         wall = statistics.median(t[1] for t in times)
-        prediction = (f"model='warm wall' loo_mae_s={warm_model['loo_mae_s']:.4f} "
+        model_name = "natural triplet wall" if natural else "warm wall"
+        prediction = (f"model={model_name!r} loo_mae_s={warm_model['loo_mae_s']:.4f} "
                       f"ratio_estimate_s={warm_model['median_ratio']*wall:.4f} "
                       f"predicted_board_s={warm_model['slope']*wall:.4f}")
         if "cpu_slope" in warm_model:
@@ -298,6 +302,9 @@ def predict(times):
             prediction += (f" warm_cpu_s={cpu:.4f} cpu_loo_mae_s={warm_model['cpu_loo_mae_s']:.4f}"
                            f" cpu_predicted_board_s={warm_model['cpu_slope']*cpu:.4f}")
         return prediction
+    if natural:
+        wall = statistics.median(t[1] for t in times)
+        return f"model='unscaled natural triplet' predicted_board_s={wall:.4f}"
     # Rows: median container lifecycle (or native process time), CPU seconds, board seconds.
     points = json.loads(calibration.read_text()) if calibration.exists() else (
         [[2.5874, 8.59367, 2.06], [2.3138, 6.65119, 1.6], [1.3575, 6.44747, 1.5], [1.189, 5.21428, 1.01], [1.0594, 5.45611, 1.03]] if image else
@@ -334,20 +341,21 @@ if public:
 if not tuning:
     dataset("holdout", 180)
     print("reserved holdout exact", flush=True)
-first = dataset("practice", 300)
+first = dataset("practice", 300, cache_state="cold" if natural else None)
 times = [first]
 if first[1] < 20:
     deadline = 300-first[1]
     for _ in range(2):
-        t = dataset("practice", max(.001, deadline), True)
+        t = dataset("practice", max(.001, deadline), True, "reuse" if natural else None)
         times.append((300, 300, 0) if t is None else t)
         deadline = max(0, deadline-(deadline if t is None else t[1]))
 official = statistics.median(t[1] for t in times)
-while len(times) < 5:
+while len(times) < 5 and not natural:
     times.append(dataset("practice", 300))
 median = statistics.median(t[0] for t in times)
-final_times = [dataset("final", 180) for _ in range(1 if tuning else (5 if rerank else 3))]
-print(f"practice_rule_s={official:.4f} local_20M_median5_s={median:.4f} "
+final_times = [dataset("final", 180, cache_state=("cold" if i == 0 else "reuse") if natural else None)
+               for i in range(1 if tuning else (5 if rerank else 3))]
+print(f"practice_rule_s={official:.4f} local_20M_median{len(times)}_s={median:.4f} "
       f"{predict(times)} "
       f"final_60M_s={statistics.median(t[0] for t in final_times):.4f} "
       f"final_rule_s={statistics.median(t[1] for t in final_times):.4f}", flush=True)

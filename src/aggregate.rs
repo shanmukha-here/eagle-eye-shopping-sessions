@@ -548,22 +548,30 @@ impl Totals {
             eoff += ne;
             coff += nc;
         }
-        let mut es = vec![M::default(); ne];
-        let mut cs = vec![Touch::default(); coff];
+        let mut es = Vec::<M>::with_capacity(ne);
+        let mut cs = Vec::<Touch>::with_capacity(coff);
+        let event_slots = es.spare_capacity_mut();
+        let click_slots = cs.spare_capacity_mut();
         for e in events.into_iter().flatten() {
             let e = e.expand(self.origin);
             let i = &mut groups[e.u as usize].1;
-            es[*i] = M::new(e, self.origin);
+            event_slots[*i].write(M::new(e, self.origin));
             *i += 1;
         }
         for c in clicks.into_iter().flatten().filter(|c| c.u != u64::MAX) {
             let i = &mut groups[c.u as usize].2;
-            cs[*i] = Touch {
+            click_slots[*i].write(Touch {
                 t: c.t,
                 id: c.id,
                 campaign: c.campaign,
-            };
+            });
             *i += 1;
+        }
+        // The prefix ranges count every event and every retained click exactly
+        // once. The two scatter passes initialized every counted position.
+        unsafe {
+            es.set_len(ne);
+            cs.set_len(coff);
         }
         let (mut e, mut c) = (0, 0);
         for (user, end_e, end_c) in groups {

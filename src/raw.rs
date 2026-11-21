@@ -16,11 +16,6 @@ unsafe fn word(p: Ptr) -> u64 {
     unsafe { p.cast::<u64>().read_unaligned() }
 }
 
-#[inline(always)]
-fn contains_zero(x: u64) -> bool {
-    x.wrapping_sub(0x0101010101010101) & !x & 0x8080808080808080 != 0
-}
-
 /// Each narrow calendar lookup compares all ten bytes. A wider window, or
 /// a date outside the seeded range, is handled by the incumbent.
 pub(super) struct Calendar {
@@ -85,12 +80,11 @@ unsafe fn id_field(p: Ptr, delimiter: u8, key: &mut u64, encode: bool) -> Ptr {
         let q = usize::from(p.read() == b'"');
         let v = p.add(q);
         let raw = word(v);
-        if raw & 0x8080808080808080 != 0
-            || contains_zero(raw)
-            || contains_zero(raw ^ 0x2c2c2c2c2c2c2c2c)
-            || contains_zero(raw ^ 0x2222222222222222)
-            || contains_zero(raw ^ 0x0a0a0a0a0a0a0a0a)
-        {
+        const HIGH: u64 = 0x8080808080808080;
+        // Bytes at least ASCII '0' cannot be a comma, quote, LF or NUL.
+        // Set the high bit in each lane before subtracting to prevent borrows.
+        let low = (raw | HIGH).wrapping_sub(0x3030303030303030);
+        if (raw | !low) & HIGH != 0 {
             return std::ptr::null();
         }
         let terminator = if q == 0 { delimiter } else { b'"' };
@@ -99,7 +93,7 @@ unsafe fn id_field(p: Ptr, delimiter: u8, key: &mut u64, encode: bool) -> Ptr {
         let width = 8 + usize::from(wide);
         if v.add(width).read() != terminator
             || v.add(width + q).read() != delimiter
-            || (wide && (ninth == 0 || ninth >= 128 || matches!(ninth, b',' | b'"' | b'\n')))
+            || (wide && ninth.wrapping_sub(b'0') > 127 - b'0')
         {
             return std::ptr::null();
         }
@@ -270,8 +264,8 @@ struct State<'a> {
 }
 
 #[inline(always)]
-unsafe fn decode_event<const WIDTH: usize, const LEVEL: usize, T: EventTime>(
-    ts: Ptr,
+unsafe fn decode_event<const LEVEL: usize, T: EventTime>(
+    time: i64,
     received: Ptr,
     tail: Ptr,
     end: Ptr,
@@ -281,11 +275,6 @@ unsafe fn decode_event<const WIDTH: usize, const LEVEL: usize, T: EventTime>(
     emit: &mut [Bucket<T>],
 ) -> bool {
     unsafe {
-        if LEVEL < 4 {
-            std::hint::black_box((id, user, ts, received));
-            return true;
-        }
-        let time = stamp::<WIDTH>(ts, state.clock);
         if time == INVALID {
             return false;
         }
@@ -372,11 +361,16 @@ unsafe fn event<const LEVEL: usize, T: EventTime>(
         }
         let id = mix(id);
         let user = if LEVEL >= 3 { mix(user) } else { 0 };
-        match width {
-            13 => decode_event::<13, LEVEL, T>(ts, received, tail, end, state, id, user, emit),
-            20 => decode_event::<20, LEVEL, T>(ts, received, tail, end, state, id, user, emit),
-            _ => decode_event::<25, LEVEL, T>(ts, received, tail, end, state, id, user, emit),
+        if LEVEL < 4 {
+            std::hint::black_box((id, user, ts, received));
+            return true;
         }
+        let time = match width {
+            13 => stamp::<13>(ts, state.clock),
+            20 => stamp::<20>(ts, state.clock),
+            _ => stamp::<25>(ts, state.clock),
+        };
+        decode_event::<LEVEL, T>(time, received, tail, end, state, id, user, emit)
     }
 }
 

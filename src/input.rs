@@ -52,7 +52,7 @@ struct Source {
     direct: Option<File>,
 }
 
-pub struct Input(Vec<Source>);
+pub struct Input(Vec<Source>, bool, usize);
 // Both the starting offset and request size are multiples of a disk page.
 const STEP: usize = 2 << 20;
 const OVERLAP: usize = 4096;
@@ -118,11 +118,15 @@ impl Input {
                 files.push((path, mapping));
             }
         }
-        let direct = sample_cache
+        let cold = sample_cache
             && files
                 .iter()
                 .max_by_key(|(_, m)| m.len())
                 .is_some_and(|(_, m)| is_cold(m));
+        let direct = cold && std::env::var_os("SHOPPING_FORCE_MMAP").is_none();
+        let prefetch = cold || std::env::var_os("SHOPPING_WARM_SKIP_PREFETCH").is_none();
+        let release_window = std::env::var("SHOPPING_RELEASE_MIB").ok()
+            .and_then(|value| value.parse::<usize>().ok()).unwrap_or(8).min(64) << 20;
         Self(
             files
                 .into_iter()
@@ -140,6 +144,8 @@ impl Input {
                     Source { mapping, direct }
                 })
                 .collect(),
+            prefetch,
+            release_window,
         )
     }
     pub fn bytes(&self) -> usize {
@@ -149,16 +155,16 @@ impl Input {
         // A single unmap of a large resident shard can hold the process mmap
         // lock while other workers need it for page faults. Clear the private
         // page-table entries in smaller ranges before the mapping is dropped.
-        const WINDOW: usize = 8 << 20;
+        let window = self.2;
         for source in self.0 {
-            if source.direct.is_none() && source.mapping.len() > WINDOW {
-                for off in (0..source.mapping.len()).step_by(WINDOW) {
+            if window != 0 && source.direct.is_none() && source.mapping.len() > window {
+                for off in (0..source.mapping.len()).step_by(window) {
                     // Data are read-only and the scanner has already joined.
                     unsafe {
                         let _ = source.mapping.unchecked_advise_range(
                             memmap2::UncheckedAdvice::DontNeed,
                             off,
-                            (source.mapping.len() - off).min(WINDOW),
+                            (source.mapping.len() - off).min(window),
                         );
                     }
                 }
@@ -166,6 +172,9 @@ impl Input {
         }
     }
     pub fn prefetch(&self, lane: usize, lanes: usize) {
+        if !self.1 {
+            return;
+        }
         for file in self.0.iter().skip(lane).step_by(lanes) {
             if file.direct.is_some() {
                 continue;

@@ -5,7 +5,7 @@ mod input;
 mod keys;
 mod output;
 
-use aggregate::{Click, Event, Stats, Totals};
+use aggregate::{Click, Event, SmallEvent, Stats, Stored, Totals};
 use input::{DAY, Dates, INVALID, Input, WEEK, jobs, rows};
 use keys::{Aliases, IntMap, Key, Keys, People, mix};
 use parquet::data_type::ByteArray;
@@ -247,10 +247,10 @@ fn events<T: EventTime>(
     );
 }
 
-fn winners<T: EventTime>(
+fn winners<T: EventTime, E: Stored>(
     parts: Vec<Bucket<T>>,
     people: &Aliases,
-    out: &mut [Vec<Event>],
+    out: &mut [Vec<E>],
     start: i64,
 ) {
     let count = parts.iter().map(|bin| bin.rows.len()).sum::<usize>();
@@ -273,12 +273,15 @@ fn winners<T: EventTime>(
         if let Some(t) = e.t.unpack(start) {
             let u = people.canonical(e.user);
             let shard = u as usize & (out.len() - 1);
-            out[shard].push(Event {
-                u,
-                t,
-                cents: d.cents,
-                cat: d.category,
-            });
+            out[shard].push(E::encode(
+                Event {
+                    u,
+                    t,
+                    cents: d.cents,
+                    cat: d.category,
+                },
+                start,
+            ));
         }
     };
     let mut repeated = IntMap::<(Candidate<T>, Detail)>::default();
@@ -319,6 +322,44 @@ fn winners<T: EventTime>(
     }
 }
 
+fn read_people(data: &Path, keys: &Keys, threads: usize) -> Aliases {
+    let links = Input::open(&data.join("links"));
+    if links.bytes() >= (1 << 20) && links.bytes() / 8 <= (1 << 26) && threads >= 3 {
+        let graph = keys::Graph::with_capacity(links.bytes() / 10);
+        let ok = jobs(
+            links.chunks(),
+            3,
+            |_| true,
+            |ok, chunk| {
+                if *ok {
+                    rows::<2>(chunk.records(), |f| {
+                        if !f[0].is_empty()
+                            && !f[1].is_empty()
+                            && graph.join(keys, keys.key(f[0]), keys.key(f[1])).is_none()
+                        {
+                            *ok = false;
+                        }
+                    });
+                }
+            },
+        );
+        if ok.into_iter().all(|x| x) {
+            return graph.freeze();
+        }
+    }
+    let mut people = People::default();
+    people.reserve(links.bytes() / 22);
+    for chunk in links.chunks() {
+        rows::<2>(chunk.records(), |f| {
+            if !f[0].is_empty() && !f[1].is_empty() {
+                people.join(keys, keys.key(f[0]), keys.key(f[1]));
+            }
+        });
+    }
+    drop(links);
+    people.freeze()
+}
+
 fn main() {
     let data = PathBuf::from(env::var_os("DATA_DIR").unwrap_or_else(|| "/data".into()));
     let out = PathBuf::from(env::var_os("OUTPUT_DIR").unwrap_or_else(|| "/output".into()));
@@ -343,31 +384,43 @@ fn main() {
     let (start, end) = (bound("window_start"), bound("window_end"));
     fs::create_dir_all(out.join("user_daily")).unwrap();
     fs::create_dir_all(out.join("campaign_daily")).unwrap();
+    let keys = Keys::default();
+    let catalog = Catalog::read(&data, &keys);
     if end.saturating_sub(start) <= u32::MAX as i64 {
-        pipeline::<u32>(&data, &out, threads, start, end, stage);
+        if catalog.categories.len() <= 256 {
+            pipeline::<u32, SmallEvent>(&data, &out, threads, start, end, keys, catalog, stage);
+        } else {
+            pipeline::<u32, Event>(&data, &out, threads, start, end, keys, catalog, stage);
+        }
     } else {
-        pipeline::<i64>(&data, &out, threads, start, end, stage);
+        pipeline::<i64, Event>(&data, &out, threads, start, end, keys, catalog, stage);
     }
 }
 
-fn pipeline<T: EventTime>(
+fn pipeline<T: EventTime, E: Stored>(
     data: &Path,
     out: &Path,
     threads: usize,
     start: i64,
     end: i64,
+    keys: Keys,
+    catalog: Catalog,
     mut stage: impl FnMut(&str),
 ) {
-    let keys = Keys::default();
-    let catalog = Catalog::read(data, &keys);
     let raw = Input::open_for_scan(&data.join("events"));
     let n = ((raw.bytes() / (6 << 20)).max(1))
         .next_power_of_two()
         .min(4096);
     let people = std::sync::OnceLock::new();
-    let mut tasks = vec![None];
-    tasks.extend(raw.chunks().into_iter().map(Some));
+    enum Scan<'a> {
+        Links,
+        Events(input::Chunk<'a>),
+        Clicks(input::Chunk<'a>),
+    }
+    let mut tasks = vec![Scan::Links];
+    tasks.extend(raw.chunks().into_iter().map(Scan::Events));
     let click_input = Input::open_for_scan(&data.join("clicks"));
+    tasks.extend(click_input.chunks().into_iter().map(Scan::Clicks));
     let lanes = std::thread::scope(|scope| {
         let readers = threads.min(4);
         for lane in 0..readers {
@@ -392,10 +445,11 @@ fn pipeline<T: EventTime>(
                         })
                         .collect::<Vec<_>>(),
                     input::ReadBuffer::new(),
+                    Vec::<Vec<Click>>::new(),
                 )
             },
-            |s, task| {
-                if let Some(chunk) = task {
+            |s, task| match task {
+                Scan::Events(chunk) => {
                     events(
                         chunk.read(&mut s.2),
                         &mut s.0,
@@ -405,41 +459,61 @@ fn pipeline<T: EventTime>(
                         end,
                         &mut s.1,
                     );
-                } else {
-                    people.get_or_init(|| {
-                        let links = Input::open(&data.join("links"));
-                        let mut people = People::default();
-                        people.reserve(links.bytes() / 22);
-                        for chunk in links.chunks() {
-                            rows::<2>(chunk.records(), |f| {
-                                if !f[0].is_empty() && !f[1].is_empty() {
-                                    people.join(&keys, keys.key(f[0]), keys.key(f[1]));
-                                }
+                }
+                Scan::Clicks(chunk) => {
+                    let mut pending = Vec::new();
+                    rows::<4>(
+                        chunk.read(&mut s.2),
+                        #[inline(always)]
+                        |f| {
+                            if f[0].is_empty() || f[1].is_empty() {
+                                return;
+                            }
+                            let Some(t) = s.0.stamp(f[3]).filter(|&t| t >= start - WEEK && t < end)
+                            else {
+                                return;
+                            };
+                            let Some(campaign) = catalog.campaigns.get(&keys, f[2]) else {
+                                return;
+                            };
+                            let u = mix(keys.key(f[1]));
+
+                            // Identical click copies have the same winner key and expire
+                            // together. The active set counts their campaign exactly once.
+                            pending.push(Click {
+                                u,
+                                t,
+                                id: keys.key(f[0]),
+                                campaign,
                             });
-                        }
-                        drop(links);
-                        people.freeze()
-                    });
+                        },
+                    );
+                    s.3.push(pending);
+                }
+                Scan::Links => {
+                    people.get_or_init(|| read_people(data, &keys, threads));
                 }
             },
         )
     });
     let people = people.into_inner().unwrap();
     let mut parts = columns(n);
-    for (_, lane, _) in lanes {
+    let mut pending = Vec::new();
+    for (_, lane, _, clicks) in lanes {
+        pending.extend(clicks);
         for (part, bucket) in parts.iter_mut().zip(lane) {
             part.push(bucket);
         }
     }
     drop(raw);
-    stage("event parse and identity graph");
+    stage("event and click parsing, identity graph");
     let person_shards = n.min(512);
-    enum Work<'a, T> {
+    enum Work<T> {
         Copies(Vec<Bucket<T>>),
-        Clicks(input::Chunk<'a>),
+        Clicks(Vec<Click>),
     }
     let mut copies = parts.into_iter();
-    let mut chunks = click_input.chunks().into_iter();
+    let mut chunks = pending.into_iter();
     let mut tasks = Vec::with_capacity(copies.len() + chunks.len());
     while copies.len() != 0 || chunks.len() != 0 {
         if let Some(part) = copies.next() {
@@ -452,52 +526,29 @@ fn pipeline<T: EventTime>(
     let lanes = jobs(
         tasks,
         threads,
-        |_| {
-            (
-                Dates::new(),
-                columns(person_shards),
-                columns(person_shards),
-                input::ReadBuffer::new(),
-            )
-        },
+        |_| (columns(person_shards), columns(person_shards)),
         |s, task| match task {
-            Work::Copies(part) => winners::<T>(part, &people, &mut s.1, start),
+            Work::Copies(part) => winners::<T, E>(part, &people, &mut s.0, start),
             Work::Clicks(chunk) => {
-                rows::<4>(
-                    chunk.read(&mut s.3),
-                    #[inline(always)]
-                    |f| {
-                        if f[0].is_empty() || f[1].is_empty() {
-                            return;
-                        }
-                        let Some(t) = s.0.stamp(f[3]).filter(|&t| t >= start - WEEK && t < end)
-                        else {
-                            return;
-                        };
-                        let Some(campaign) = catalog.campaigns.get(&keys, f[2]) else {
-                            return;
-                        };
-                        let u = people.canonical(mix(keys.key(f[1])));
-                        let bucket = u as usize & (person_shards - 1);
-                        // Identical click copies have the same winner key and expire
-                        // together. The active set counts their campaign exactly once.
-                        s.2[bucket].push(Click {
-                            u,
-                            t,
-                            id: keys.key(f[0]),
-                            campaign,
-                        });
-                    },
-                );
+                for block in chunk.chunks(32) {
+                    for c in block {
+                        people.prefetch(c.u);
+                    }
+                    for c in block {
+                        let u = people.canonical(c.u);
+                        let shard = u as usize & (person_shards - 1);
+                        s.1[shard].push(Click { u, ..*c });
+                    }
+                }
             }
         },
     );
-    let (events, clicks): (Vec<_>, Vec<_>) = lanes.into_iter().map(|(_, e, c, _)| (e, c)).unzip();
+    let (events, clicks): (Vec<_>, Vec<_>) = lanes.into_iter().unzip();
     let event_parts = transpose(events, person_shards);
     let click_parts = transpose(clicks, person_shards);
     drop(click_input);
     drop(people);
-    stage("event dedup and click parsing");
+    stage("event dedup and click routing");
     let work = event_parts.into_iter().zip(click_parts).collect();
     let partial = input::jobs_finish(
         work,

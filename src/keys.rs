@@ -221,6 +221,112 @@ impl People {
         Aliases { table }
     }
 }
+// Nonempty keys use zero as the empty slot sentinel. The parent stores a
+// slot index plus one, with zero identifying a root. Entries never move.
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+#[derive(Default)]
+struct Vertex {
+    key: AtomicU64,
+    parent: AtomicU32,
+}
+pub struct Graph(Vec<Vertex>);
+impl Graph {
+    pub fn with_capacity(slots: usize) -> Self {
+        Self(
+            (0..slots.max(16).next_power_of_two())
+                .map(|_| Vertex::default())
+                .collect(),
+        )
+    }
+    fn node(&self, key: Key) -> Option<usize> {
+        let mask = self.0.len() - 1;
+        let mut i = key as usize & mask;
+        // Highly clustered or unexpectedly dense input can use the growable
+        // serial graph. A failed insertion invalidates the whole parallel run.
+        for _ in 0..128 {
+            let cell = &self.0[i].key;
+            let seen = cell.load(Relaxed);
+            if seen == key {
+                return Some(i);
+            }
+            if seen == 0 {
+                match cell.compare_exchange(0, key, Relaxed, Relaxed) {
+                    Ok(_) => return Some(i),
+                    Err(other) if other == key => return Some(i),
+                    _ => {}
+                }
+            }
+            i = (i + 1) & mask;
+        }
+        None
+    }
+    fn root(&self, mut i: usize) -> usize {
+        loop {
+            let parent = &self.0[i].parent;
+            let p = parent.load(Relaxed);
+            if p == 0 {
+                return i;
+            }
+            i = (p - 1) as usize;
+            let next = self.0[i].parent.load(Relaxed);
+            if next != 0 {
+                let _ = parent.compare_exchange(p, next, Relaxed, Relaxed);
+                i = (next - 1) as usize;
+            }
+        }
+    }
+    pub fn join(&self, keys: &Keys, a: Key, b: Key) -> Option<()> {
+        let (mut a, mut b) = (self.node(mix(a))?, self.node(mix(b))?);
+        loop {
+            a = self.root(a);
+            b = self.root(b);
+            if a == b {
+                return Some(());
+            }
+            // Every successful hook goes to a lexically smaller key, even if
+            // another worker concurrently attaches that target to its own root.
+            if keys
+                .cmp(
+                    unmix(self.0[a].key.load(Relaxed)),
+                    unmix(self.0[b].key.load(Relaxed)),
+                )
+                .is_lt()
+            {
+                std::mem::swap(&mut a, &mut b);
+            }
+            if self.0[a]
+                .parent
+                .compare_exchange(0, (b + 1) as u32, Relaxed, Relaxed)
+                .is_ok()
+            {
+                return Some(());
+            }
+        }
+    }
+    pub fn freeze(&self) -> Aliases {
+        let count = self
+            .0
+            .iter()
+            .filter(|v| v.parent.load(Relaxed) != 0)
+            .count();
+        let cap = (count.saturating_mul(2) + 1).next_power_of_two();
+        let mut table = vec![(0, 0); cap];
+        for (i, v) in self.0.iter().enumerate() {
+            if v.parent.load(Relaxed) == 0 {
+                continue;
+            }
+            let key = v.key.load(Relaxed);
+            let name = self.0[self.root(i)].key.load(Relaxed);
+            let mut j = key as usize & (cap - 1);
+            while table[j].0 != 0 {
+                j = (j + 1) & (cap - 1);
+            }
+            table[j] = (key, name);
+        }
+        Aliases { table }
+    }
+}
+
 pub struct Aliases {
     table: Vec<(Key, Key)>,
 }
@@ -255,6 +361,48 @@ impl Aliases {
 #[cfg(test)]
 mod tests {
     use super::{Keys, mix, unmix};
+    #[test]
+    fn concurrent_components_choose_the_exact_smallest_name() {
+        use super::{Graph, People};
+        let keys = Keys::default();
+        let mut names: Vec<_> = (0..512)
+            .map(|i| keys.key(format!("user-{i:04}").as_bytes()))
+            .collect();
+        names.push(keys.key("北-long".as_bytes()));
+        names.push(keys.key(b"user-0001-extra"));
+        let edges: Vec<_> = (1..names.len())
+            .filter(|i| i % 7 != 0)
+            .map(|i| (names[i], names[i - 1]))
+            .collect();
+        let mut serial = People::default();
+        serial.reserve(edges.len());
+        for &(a, b) in &edges {
+            serial.join(&keys, a, b);
+        }
+        let expected = serial.freeze();
+        let graph = Graph::with_capacity(2048);
+        std::thread::scope(|scope| {
+            for k in 0..6 {
+                let (graph, keys, edges) = (&graph, &keys, &edges);
+                scope.spawn(move || {
+                    for &(a, b) in edges.iter().skip(k).step_by(6).chain(edges.iter().rev()) {
+                        graph.join(keys, a, b).unwrap();
+                    }
+                });
+            }
+        });
+        let got = graph.freeze();
+        for k in names {
+            assert_eq!(got.canonical(mix(k)), expected.canonical(mix(k)));
+        }
+        let small = Graph::with_capacity(16);
+        assert!(
+            edges
+                .iter()
+                .any(|&(a, b)| small.join(&keys, a, b).is_none())
+        );
+    }
+
     #[test]
     fn hash_permutation_round_trips() {
         for n in 0u64..50_000 {

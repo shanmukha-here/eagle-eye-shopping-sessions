@@ -11,6 +11,46 @@ pub struct Event {
     pub cents: u32,
     pub cat: u32,
 }
+pub trait Stored: Copy + Send {
+    fn encode(event: Event, start: i64) -> Self;
+    fn expand(self, start: i64) -> Event;
+    fn user(&mut self) -> &mut Key;
+}
+impl Stored for Event {
+    fn encode(event: Event, _: i64) -> Self {
+        event
+    }
+    fn expand(self, _: i64) -> Event {
+        self
+    }
+    fn user(&mut self) -> &mut Key {
+        &mut self.u
+    }
+}
+#[derive(Clone, Copy)]
+pub struct SmallEvent {
+    user: Key,
+    data: u64,
+}
+impl Stored for SmallEvent {
+    fn encode(e: Event, start: i64) -> Self {
+        Self {
+            user: e.u,
+            data: ((e.t - start) as u64) << 32 | (u64::from(e.cat) << 24) | u64::from(e.cents),
+        }
+    }
+    fn expand(self, start: i64) -> Event {
+        Event {
+            u: self.user,
+            t: start + (self.data >> 32) as i64,
+            cents: self.data as u32 & 0xffffff,
+            cat: (self.data as u32) >> 24,
+        }
+    }
+    fn user(&mut self) -> &mut Key {
+        &mut self.user
+    }
+}
 #[derive(Clone, Copy, Default)]
 pub struct Click {
     pub u: Key,
@@ -287,17 +327,22 @@ impl Totals {
             self.counts[c as usize] = 0;
         }
     }
-    pub fn partition(&mut self, keys: &Keys, events: Vec<Vec<Event>>, clicks: Vec<Vec<Click>>) {
-        if self.packed {
-            self.partition_inner::<u64>(keys, events, clicks)
-        } else {
-            self.partition_inner::<Moment>(keys, events, clicks)
-        }
-    }
-    fn partition_inner<M: Observation>(
+    pub fn partition<E: Stored>(
         &mut self,
         keys: &Keys,
-        mut events: Vec<Vec<Event>>,
+        events: Vec<Vec<E>>,
+        clicks: Vec<Vec<Click>>,
+    ) {
+        if self.packed {
+            self.partition_inner::<u64, E>(keys, events, clicks)
+        } else {
+            self.partition_inner::<Moment, E>(keys, events, clicks)
+        }
+    }
+    fn partition_inner<M: Observation, E: Stored>(
+        &mut self,
+        keys: &Keys,
+        mut events: Vec<Vec<E>>,
         mut clicks: Vec<Vec<Click>>,
     ) {
         let ne = events.iter().map(Vec::len).sum::<usize>();
@@ -307,17 +352,18 @@ impl Totals {
         let mut table = vec![IndexSlot::default(); (ne / 12 + 8).next_power_of_two()];
         let mut groups: Vec<(Key, usize, usize)> = Vec::new();
         for e in events.iter_mut().flatten() {
-            let i = position(&table, e.u);
+            let u = e.user();
+            let i = position(&table, *u);
             if table[i].key == 0 {
                 table[i] = IndexSlot {
-                    key: e.u,
+                    key: *u,
                     index: groups.len(),
                 };
-                groups.push((crate::keys::unmix(e.u), 0, 0));
+                groups.push((crate::keys::unmix(*u), 0, 0));
             }
             let index = table[i].index;
             groups[index].1 += 1;
-            e.u = index as u64;
+            *u = index as u64;
             if groups.len() * 4 >= table.len() * 3 {
                 let n = table.len() * 2;
                 let old = std::mem::replace(&mut table, vec![IndexSlot::default(); n]);
@@ -347,6 +393,7 @@ impl Totals {
         let mut es = vec![M::default(); ne];
         let mut cs = vec![Touch::default(); coff];
         for e in events.into_iter().flatten() {
+            let e = e.expand(self.origin);
             let i = &mut groups[e.u as usize].1;
             es[*i] = M::new(e, self.origin);
             *i += 1;

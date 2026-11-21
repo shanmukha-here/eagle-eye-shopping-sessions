@@ -224,7 +224,7 @@ def dataset(name, limit, allow_cutoff=False):
 def predict(times):
     # Rows: median container lifecycle (or native process time), CPU seconds, board seconds.
     points = json.loads(calibration.read_text()) if calibration.exists() else (
-        [[2.5874, 8.59367, 2.06], [2.3138, 6.65119, 1.6], [1.3575, 6.44747, 1.5], [1.189, 5.21428, 1.01]] if image else
+        [[2.5874, 8.59367, 2.06], [2.3138, 6.65119, 1.6], [1.3575, 6.44747, 1.5], [1.189, 5.21428, 1.01], [1.0594, 5.45611, 1.03]] if image else
         [[4.8245, 12.37469, 2.06], [4.4715, 9.55942, 1.6], [4.0621, 7.6297, 1.5], [3.9095, 6.40911, 1.01]])
     mae, _, name, _, parameters = select_model(points)[0]
     wall = statistics.median(t[1] for t in times)
@@ -274,3 +274,28 @@ print(f"practice_rule_s={official:.4f} local_20M_median5_s={median:.4f} "
       f"{predict(times)} "
       f"final_60M_s={statistics.median(t[0] for t in final_times):.4f} "
       f"final_rule_s={statistics.median(t[1] for t in final_times):.4f}", flush=True)
+
+
+# Compare a challenger with a scored control under the same cache and host
+# conditions. The alternating order balances time trends and Docker jitter.
+control = os.environ.get("BOARD_CONTROL_IMAGE")
+if control:
+    if not image or image == control:
+        sys.exit("paired measurements require two distinct image tags")
+    score = float(os.environ["BOARD_CONTROL_SCORE"])
+    if not 0 < score < float("inf"):
+        sys.exit("BOARD_CONTROL_SCORE must be a finite positive score")
+    candidate = image
+    ratios = []
+    for pair in range(6):
+        order = (control, candidate) if pair % 2 == 0 else (candidate, control)
+        clocks = {}
+        for image in order:
+            clocks[image] = dataset("practice", 300)[1]
+        ratios.append(clocks[candidate] / clocks[control])
+        print(f"pair={pair+1} control_s={clocks[control]:.4f} "
+              f"candidate_s={clocks[candidate]:.4f}", flush=True)
+    image = candidate
+    ratio = statistics.median(ratios)
+    print(f"control_board_s={score:.4f} paired_local_ratio={ratio:.5f} "
+          f"paired_predicted_board_s={score*ratio:.4f}", flush=True)

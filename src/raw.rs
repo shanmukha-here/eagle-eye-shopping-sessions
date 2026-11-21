@@ -297,7 +297,11 @@ unsafe fn decode_event<const WIDTH: usize, const LEVEL: usize, T: EventTime>(
         if day == INVALID || received.add(10).read() != b'T' || received.add(19).read() != b'Z' {
             return false;
         }
-        let arrival = day + hms::<false>(received);
+        let receive_ms = hms::<true>(received);
+        if receive_ms == INVALID {
+            return false;
+        }
+        let arrival = day + receive_ms;
         if LEVEL == 5 {
             std::hint::black_box(arrival);
             return true;
@@ -436,6 +440,165 @@ pub(super) fn events<T: EventTime>(
             5 => event_loop::<5, T>(data, date, keys, catalog, state, emit),
             6 => event_loop::<6, T>(data, date, keys, catalog, state, emit),
             _ => event_loop::<7, T>(data, date, keys, catalog, state, emit),
+        }
+    }
+}
+
+#[inline(always)]
+unsafe fn click(
+    p: Ptr,
+    end: Ptr,
+    state: State<'_>,
+    catalog: &Catalog,
+    out: &mut Vec<Click>,
+) -> bool {
+    unsafe {
+        let (mut id, mut user) = (0, 0);
+        let next = id_field(p, b',', &mut id, true);
+        if next.is_null() {
+            return false;
+        }
+        let campaign = id_field(next, b',', &mut user, true);
+        if campaign.is_null() {
+            return false;
+        }
+        let q = usize::from(campaign.read() == b'"');
+        let label = campaign.add(q);
+        if label.cast::<u16>().read_unaligned() != u16::from_le_bytes(*b"c_") {
+            return false;
+        }
+        let digits = label.add(2);
+        let mut len = 0;
+        let mut number = 0usize;
+        while len < 7 {
+            let digit = digits.add(len).read().wrapping_sub(b'0');
+            if digit > 9 {
+                break;
+            }
+            len += 1;
+            number = number * 10 + usize::from(digit);
+        }
+        if len == 0
+            || (len > 1 && digits.read() == b'0')
+            || number >= catalog.campaigns.values.len()
+        {
+            return false;
+        }
+        let code = *catalog.campaigns.values.get_unchecked(number);
+        if code == u32::MAX {
+            return false;
+        }
+        let clock = suffix(label, 2 + len, q, b',');
+        if clock.is_null() {
+            return false;
+        }
+        let q = usize::from(clock.read() == b'"');
+        let stamp_ptr = clock.add(q);
+        if stamp_ptr > end {
+            return false;
+        }
+        let width = end.offset_from(stamp_ptr) as usize;
+        if width < q || (q == 1 && end.sub(1).read() != b'"') {
+            return false;
+        }
+        let time = match width - q {
+            13 => stamp::<13>(stamp_ptr, state.clock),
+            20 => stamp::<20>(stamp_ptr, state.clock),
+            25 => stamp::<25>(stamp_ptr, state.clock),
+            _ => return false,
+        };
+        if time == INVALID {
+            return false;
+        }
+        if time >= state.start - WEEK && time < state.end {
+            out.push(Click {
+                u: mix(user),
+                t: time,
+                id,
+                campaign: code,
+            });
+        }
+        true
+    }
+}
+
+pub(super) fn clicks(
+    data: &[u8],
+    date: &mut Dates,
+    keys: &Keys,
+    catalog: &Catalog,
+    clock: &Calendar,
+    start: i64,
+    end: i64,
+    out: &mut Vec<Click>,
+    fast: bool,
+) {
+    if fast {
+        // The caller selected AVX2 before enabling this scanner.
+        unsafe { click_loop(data, date, keys, catalog, State { start, end, clock }, out) }
+    } else {
+        crate::clicks(data, date, keys, catalog, start, end, out);
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn click_loop(
+    data: &[u8],
+    date: &mut Dates,
+    keys: &Keys,
+    catalog: &Catalog,
+    state: State<'_>,
+    out: &mut Vec<Click>,
+) {
+    unsafe {
+        let limit = data.as_ptr().add(data.len());
+        let mut p = data.as_ptr();
+        while p < limit {
+            let end = next_lf(p, limit);
+            let next = end.add(usize::from(end < limit));
+            if limit.offset_from(p) < 128
+                || end.offset_from(p) < 32
+                || !click(p, end, state, catalog, out)
+            {
+                let row = std::slice::from_raw_parts(p, next.offset_from(p) as usize);
+                crate::clicks(row, date, keys, catalog, state.start, state.end, out);
+            }
+            p = next;
+        }
+    }
+}
+
+pub(super) fn links(data: &[u8], keys: &Keys, fast: bool, mut pair: impl FnMut(u64, u64)) {
+    if fast {
+        // The caller selected AVX2 before enabling this scanner.
+        unsafe {
+            link_loop(data, keys, &mut pair);
+        }
+    } else {
+        crate::links(data, keys, pair);
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn link_loop(data: &[u8], keys: &Keys, pair: &mut impl FnMut(u64, u64)) {
+    unsafe {
+        let limit = data.as_ptr().add(data.len());
+        let mut p = data.as_ptr();
+        while p < limit {
+            let end = next_lf(p, limit);
+            let next = end.add(usize::from(end < limit));
+            if limit.offset_from(p) >= 128 && end.offset_from(p) >= 17 {
+                let (mut a, mut b) = (0, 0);
+                let right = id_field(p, b',', &mut a, true);
+                if !right.is_null() && id_field(right, b'\n', &mut b, true) == next {
+                    pair(a, b);
+                    p = next;
+                    continue;
+                }
+            }
+            let row = std::slice::from_raw_parts(p, next.offset_from(p) as usize);
+            crate::links(row, keys, &mut *pair);
+            p = next;
         }
     }
 }

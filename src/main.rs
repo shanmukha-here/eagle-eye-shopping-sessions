@@ -324,7 +324,47 @@ fn winners<T: EventTime, E: Stored>(
     }
 }
 
-fn read_people(data: &Path, keys: &Keys, threads: usize) -> Aliases {
+fn links(data: &[u8], keys: &Keys, mut pair: impl FnMut(Key, Key)) {
+    rows::<2>(data, |f| {
+        if !f[0].is_empty() && !f[1].is_empty() {
+            pair(keys.key(f[0]), keys.key(f[1]));
+        }
+    });
+}
+
+fn clicks(
+    data: &[u8],
+    date: &mut Dates,
+    keys: &Keys,
+    catalog: &Catalog,
+    start: i64,
+    end: i64,
+    out: &mut Vec<Click>,
+) {
+    rows::<4>(
+        data,
+        #[inline(always)]
+        |f| {
+            if f[0].is_empty() || f[1].is_empty() {
+                return;
+            }
+            let Some(t) = date.stamp(f[3]).filter(|&t| t >= start - WEEK && t < end) else {
+                return;
+            };
+            let Some(campaign) = catalog.campaigns.get(keys, f[2]) else {
+                return;
+            };
+            out.push(Click {
+                u: mix(keys.key(f[1])),
+                t,
+                id: keys.key(f[0]),
+                campaign,
+            });
+        },
+    );
+}
+
+fn read_people(data: &Path, keys: &Keys, threads: usize, fast: bool) -> Aliases {
     let links = Input::open(&data.join("links"));
     if links.bytes() >= (1 << 20) && links.bytes() / 8 <= (1 << 26) && threads >= 3 {
         let graph = keys::Graph::with_capacity(links.bytes() / 10);
@@ -334,11 +374,8 @@ fn read_people(data: &Path, keys: &Keys, threads: usize) -> Aliases {
             |_| true,
             |ok, chunk| {
                 if *ok {
-                    rows::<2>(chunk.records(), |f| {
-                        if !f[0].is_empty()
-                            && !f[1].is_empty()
-                            && graph.join(keys, keys.key(f[0]), keys.key(f[1])).is_none()
-                        {
+                    raw::links(chunk.records(), keys, fast, |a, b| {
+                        if graph.join(keys, a, b).is_none() {
                             *ok = false;
                         }
                     });
@@ -352,11 +389,7 @@ fn read_people(data: &Path, keys: &Keys, threads: usize) -> Aliases {
     let mut people = People::default();
     people.reserve(links.bytes() / 22);
     for chunk in links.chunks() {
-        rows::<2>(chunk.records(), |f| {
-            if !f[0].is_empty() && !f[1].is_empty() {
-                people.join(keys, keys.key(f[0]), keys.key(f[1]));
-            }
-        });
+        raw::links(chunk.records(), keys, fast, |a, b| people.join(keys, a, b));
     }
     drop(links);
     people.freeze()
@@ -416,6 +449,7 @@ fn pipeline<T: EventTime, E: Stored>(
     let people = std::sync::OnceLock::new();
     let clock = raw::Calendar::new(start, end);
     let fast = raw::available() && env::var_os("SHOPPING_RAW_EVENTS").is_some();
+    let raw_aux = fast && env::var_os("SHOPPING_RAW_NO_AUX").is_none();
     let probe = env::var_os("SHOPPING_PROBE_EVENTS").is_some();
     let level = env::var("SHOPPING_RAW_FIELD")
         .ok()
@@ -479,36 +513,21 @@ fn pipeline<T: EventTime, E: Stored>(
                 }
                 Scan::Clicks(chunk) => {
                     let mut pending = Vec::new();
-                    rows::<4>(
+                    raw::clicks(
                         chunk.read(&mut s.2),
-                        #[inline(always)]
-                        |f| {
-                            if f[0].is_empty() || f[1].is_empty() {
-                                return;
-                            }
-                            let Some(t) = s.0.stamp(f[3]).filter(|&t| t >= start - WEEK && t < end)
-                            else {
-                                return;
-                            };
-                            let Some(campaign) = catalog.campaigns.get(&keys, f[2]) else {
-                                return;
-                            };
-                            let u = mix(keys.key(f[1]));
-
-                            // Identical click copies have the same winner key and expire
-                            // together. The active set counts their campaign exactly once.
-                            pending.push(Click {
-                                u,
-                                t,
-                                id: keys.key(f[0]),
-                                campaign,
-                            });
-                        },
+                        &mut s.0,
+                        &keys,
+                        &catalog,
+                        &clock,
+                        start,
+                        end,
+                        &mut pending,
+                        raw_aux,
                     );
                     s.3.push(pending);
                 }
                 Scan::Links => {
-                    people.get_or_init(|| read_people(data, &keys, threads));
+                    people.get_or_init(|| read_people(data, &keys, threads, raw_aux));
                 }
             },
         )

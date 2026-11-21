@@ -7,6 +7,6 @@ ENV CARGO_PROFILE_RELEASE_LTO=fat CARGO_PROFILE_RELEASE_PANIC=abort
 RUN cargo build -j 4 --release --locked --target x86_64-unknown-linux-gnu && strip target/x86_64-unknown-linux-gnu/release/shopping-sessions
 FROM scratch
 COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/shopping-sessions /shopping-sessions
-ENV SHOPPING_RAW_EVENTS=1 SHOPPING_MASKED_PREFIX=1
+ENV SHOPPING_RAW_EVENTS=1 SHOPPING_MASKED_PREFIX=1 SHOPPING_FORCE_MMAP=1
 USER 1000:1000
 ENTRYPOINT ["/shopping-sessions"]

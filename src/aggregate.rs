@@ -95,6 +95,7 @@ pub struct Totals {
     counts: Vec<u32>,
     active: Vec<u32>,
     positions: Vec<usize>,
+    bins: SessionBins,
 }
 #[derive(Clone, Copy, Default)]
 struct IndexSlot {
@@ -202,6 +203,45 @@ impl DenseScratch {
     }
 }
 
+const GAP: u32 = 1_800_000;
+const BIN_BITS: u32 = 20;
+const BIN_THRESHOLD: usize = 256;
+const N_BINS: usize = 1 << (32 - BIN_BITS);
+
+#[derive(Clone, Copy)]
+struct SessionBin {
+    first: u32,
+    last: u32,
+    count: u32,
+    purchase: u32,
+}
+
+impl Default for SessionBin {
+    fn default() -> Self {
+        Self {
+            first: u32::MAX,
+            last: 0,
+            count: 0,
+            purchase: 0,
+        }
+    }
+}
+
+#[derive(Default)]
+struct SessionBins {
+    bins: Vec<SessionBin>,
+    purchased: Vec<(u32, u32, u32)>,
+}
+
+#[derive(Default)]
+struct Window {
+    left: usize,
+    right: usize,
+    last_time: i64,
+    winner: u32,
+    winner_id: Key,
+}
+
 impl Totals {
     pub fn new(cats: usize, camps: usize, start: i64, end: i64) -> Self {
         let base_day = start.div_euclid(DAY) as i32;
@@ -224,6 +264,7 @@ impl Totals {
             counts: vec![0; camps],
             active: Vec::new(),
             positions: vec![0; camps],
+            bins: SessionBins::default(),
         }
     }
     pub fn days(self) -> BTreeMap<i32, Vec<Stats>> {
@@ -271,10 +312,11 @@ impl Totals {
             day: events[0].time(self.origin).div_euclid(DAY) as i32,
             ..Default::default()
         };
-        let (mut at, mut left, mut right) = (0, 0, 0);
-        let mut last_time = i64::MIN;
-        let mut winner = 0;
-        let mut winner_id = 0;
+        let mut at = 0;
+        let mut window = Window {
+            last_time: i64::MIN,
+            ..Window::default()
+        };
         while at < events.len() {
             let start = events[at].time(self.origin);
             let day = start.div_euclid(DAY) as i32;
@@ -308,48 +350,167 @@ impl Totals {
             row.sessions += 1;
             row.events += (at - first) as i64;
             row.revenue += revenue;
-            while right < clicks.len() && clicks[right].t <= start {
-                let c = clicks[right];
-                self.add_click(c.campaign);
-                if c.t != last_time || keys.cmp(c.id, winner_id).is_lt() {
-                    last_time = c.t;
-                    winner_id = c.id;
-                    winner = c.campaign;
-                }
-                right += 1;
-            }
-            while left < right && clicks[left].t < start - WEEK {
-                self.expire(clicks[left].campaign);
-                left += 1;
-            }
-            let stats = if !self.dense_days.is_empty() {
-                let stats = &mut self.dense_days[(day - self.base_day) as usize];
-                if stats.is_empty() {
-                    stats.resize(self.counts.len(), Stats::default());
-                }
-                stats
-            } else {
-                self.campaigns
-                    .entry(day)
-                    .or_insert_with(|| vec![Stats::default(); self.counts.len()])
-            };
-            let credit = if self.active.is_empty() {
-                0
-            } else {
-                winner as usize
-            };
-            stats[credit].sessions += 1;
-            stats[credit].buying += i64::from(revenue > 0);
-            stats[credit].revenue += revenue;
-            for &c in &self.active {
-                stats[c as usize].assists += 1;
-            }
+            self.credit(keys, clicks, start, day, revenue, &mut window);
         }
         self.finish_day(row);
         for c in self.active.drain(..) {
             self.counts[c as usize] = 0;
         }
     }
+    #[inline(always)]
+    fn credit(
+        &mut self,
+        keys: &Keys,
+        clicks: &[Touch],
+        start: i64,
+        day: i32,
+        revenue: i64,
+        window: &mut Window,
+    ) {
+        while window.right < clicks.len() && clicks[window.right].t <= start {
+            let c = clicks[window.right];
+            self.add_click(c.campaign);
+            if c.t != window.last_time || keys.cmp(c.id, window.winner_id).is_lt() {
+                window.last_time = c.t;
+                window.winner_id = c.id;
+                window.winner = c.campaign;
+            }
+            window.right += 1;
+        }
+        while window.left < window.right && clicks[window.left].t < start - WEEK {
+            self.expire(clicks[window.left].campaign);
+            window.left += 1;
+        }
+        let stats = if !self.dense_days.is_empty() {
+            let stats = &mut self.dense_days[(day - self.base_day) as usize];
+            if stats.is_empty() {
+                stats.resize(self.counts.len(), Stats::default());
+            }
+            stats
+        } else {
+            self.campaigns
+                .entry(day)
+                .or_insert_with(|| vec![Stats::default(); self.counts.len()])
+        };
+        let credit = if self.active.is_empty() {
+            0
+        } else {
+            window.winner as usize
+        };
+        stats[credit].sessions += 1;
+        stats[credit].buying += i64::from(revenue > 0);
+        stats[credit].revenue += revenue;
+        for &c in &self.active {
+            stats[c as usize].assists += 1;
+        }
+    }
+    fn person_binned<M: Observation>(
+        &mut self,
+        keys: &Keys,
+        u: Key,
+        events: &[M],
+        clicks: &[Touch],
+    ) {
+        let mut scratch = std::mem::take(&mut self.bins);
+        scratch.bins.resize(N_BINS, SessionBin::default());
+        scratch.purchased.clear();
+        // Each interval is shorter than the session gap, so all of its
+        // events are connected without sorting. Adjacent occupied intervals
+        // connect exactly when their nearest observed times are within GAP.
+        let mut present = [0u64; N_BINS / 64];
+        let origin = self.origin;
+        for &event in events {
+            let time = (event.time(origin) - origin) as u32;
+            let index = (time >> BIN_BITS) as usize;
+            let bin = &mut scratch.bins[index];
+            bin.first = bin.first.min(time);
+            bin.last = bin.last.max(time);
+            bin.count += 1;
+            present[index >> 6] |= 1 << (index & 63);
+            if event.cents() != 0 {
+                scratch
+                    .purchased
+                    .push((event.category(), event.cents(), bin.purchase));
+                bin.purchase = scratch.purchased.len() as u32;
+            }
+        }
+
+        let mut row = UserRow {
+            u,
+            day: i32::MIN,
+            ..UserRow::default()
+        };
+        // The latest left and earliest right timestamps give the actual
+        // gap across intervals, including at reporting-day boundaries.
+        let mut previous = 0u32;
+        let mut session_start = 0i64;
+        let mut session_revenue = 0;
+        let mut window = Window {
+            last_time: i64::MIN,
+            ..Window::default()
+        };
+        for (upper, mut bits) in present.into_iter().enumerate() {
+            while bits != 0 {
+                let index = upper * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                let bin = std::mem::take(&mut scratch.bins[index]);
+                if row.sessions == 0 || bin.first - previous > GAP {
+                    if row.sessions != 0 {
+                        self.credit(
+                            keys,
+                            clicks,
+                            session_start,
+                            row.day,
+                            session_revenue,
+                            &mut window,
+                        );
+                    }
+                    session_start = origin + i64::from(bin.first);
+                    let day = session_start.div_euclid(DAY) as i32;
+                    if row.day != day {
+                        if row.sessions != 0 {
+                            self.finish_day(row);
+                        }
+                        row = UserRow {
+                            u,
+                            day,
+                            ..UserRow::default()
+                        };
+                    }
+                    row.sessions += 1;
+                    session_revenue = 0;
+                }
+                previous = bin.last;
+                row.events += i64::from(bin.count);
+                let mut purchase = bin.purchase;
+                while purchase != 0 {
+                    let (category, cents, next) = scratch.purchased[(purchase - 1) as usize];
+                    let value = &mut self.category_cents[category as usize];
+                    if *value == 0 {
+                        self.touched.push(category);
+                    }
+                    *value += i64::from(cents);
+                    session_revenue += i64::from(cents);
+                    row.revenue += i64::from(cents);
+                    purchase = next;
+                }
+            }
+        }
+        self.credit(
+            keys,
+            clicks,
+            session_start,
+            row.day,
+            session_revenue,
+            &mut window,
+        );
+        self.finish_day(row);
+        for c in self.active.drain(..) {
+            self.counts[c as usize] = 0;
+        }
+        self.bins = scratch;
+    }
+
     pub(crate) fn partition_dense(
         &mut self,
         keys: &Keys,
@@ -577,9 +738,13 @@ impl Totals {
         for (user, end_e, end_c) in groups {
             let events = &mut es[e..end_e];
             let clicks = &mut cs[c..end_c];
-            M::order(events);
-            clicks.sort_unstable_by_key(|c| c.t);
-            self.person(keys, user, events, clicks);
+            clicks.sort_unstable_by_key(|click| click.t);
+            if self.packed && (BIN_THRESHOLD..=u32::MAX as usize).contains(&events.len()) {
+                self.person_binned(keys, user, events, clicks);
+            } else {
+                M::order(events);
+                self.person(keys, user, events, clicks);
+            }
             e = end_e;
             c = end_c;
         }

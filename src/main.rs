@@ -344,7 +344,7 @@ fn read_people(data: &Path, keys: &Keys, threads: usize) -> Aliases {
             },
         );
         if ok.into_iter().all(|x| x) {
-            return graph.freeze();
+            return graph.freeze(threads);
         }
     }
     let mut people = People::default();
@@ -505,7 +505,12 @@ fn pipeline<T: EventTime, E: Stored>(
             part.push(bucket);
         }
     }
-    drop(raw);
+    // Every parser has joined. Release the input page tables while workers
+    // reduce events, so the main thread need not unmap gigabytes at a barrier.
+    let release_inputs = std::thread::spawn(move || {
+        raw.release();
+        click_input.release();
+    });
     stage("event and click parsing, identity graph");
     let person_shards = n.min(512);
     enum Work<T> {
@@ -546,7 +551,7 @@ fn pipeline<T: EventTime, E: Stored>(
     let (events, clicks): (Vec<_>, Vec<_>) = lanes.into_iter().unzip();
     let event_parts = transpose(events, person_shards);
     let click_parts = transpose(clicks, person_shards);
-    drop(click_input);
+    release_inputs.join().unwrap();
     drop(people);
     stage("event dedup and click routing");
     let work = event_parts.into_iter().zip(click_parts).collect();

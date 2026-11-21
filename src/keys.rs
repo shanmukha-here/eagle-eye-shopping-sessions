@@ -204,7 +204,7 @@ impl People {
             count += usize::from(r as usize != i);
         }
         let cap = (count * 2 + 1).next_power_of_two();
-        let mut table = vec![(0, 0); cap];
+        let table = Aliases::empty(cap);
         for (key, id) in self.index {
             let name = self.names[id as usize];
             if key == name {
@@ -213,12 +213,13 @@ impl People {
             let key = mix(key);
             let name = mix(name);
             let mut i = key as usize & (cap - 1);
-            while table[i].0 != 0 {
+            while table.table[i].0.load(Relaxed) != 0 {
                 i = (i + 1) & (cap - 1);
             }
-            table[i] = (key, name);
+            table.table[i].0.store(key, Relaxed);
+            table.table[i].1.store(name, Relaxed);
         }
-        Aliases { table }
+        table
     }
 }
 // Nonempty keys use zero as the empty slot sentinel. The parent stores a
@@ -303,34 +304,58 @@ impl Graph {
             }
         }
     }
-    pub fn freeze(&self) -> Aliases {
-        let count = self
-            .0
-            .iter()
-            .filter(|v| v.parent.load(Relaxed) != 0)
-            .count();
-        let cap = (count.saturating_mul(2) + 1).next_power_of_two();
-        let mut table = vec![(0, 0); cap];
-        for (i, v) in self.0.iter().enumerate() {
-            if v.parent.load(Relaxed) == 0 {
-                continue;
+    pub fn freeze(&self, threads: usize) -> Aliases {
+        let block = self.0.len().div_ceil(threads.max(1));
+        let count = std::thread::scope(|scope| {
+            self.0
+                .chunks(block)
+                .map(|part| {
+                    scope.spawn(move || part.iter().filter(|v| v.parent.load(Relaxed) != 0).count())
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|t| t.join().unwrap())
+                .sum::<usize>()
+        });
+        let cap = (2 * count + 1).next_power_of_two();
+        let aliases = Aliases::empty(cap);
+        std::thread::scope(|scope| {
+            for (part, vertices) in self.0.chunks(block).enumerate() {
+                let table = &aliases.table;
+                scope.spawn(move || {
+                    for (off, v) in vertices.iter().enumerate() {
+                        if v.parent.load(Relaxed) == 0 {
+                            continue;
+                        }
+                        let key = v.key.load(Relaxed);
+                        let name = self.0[self.root(part * block + off)].key.load(Relaxed);
+                        let mut j = key as usize & (cap - 1);
+                        while table[j]
+                            .0
+                            .compare_exchange(0, key, Relaxed, Relaxed)
+                            .is_err()
+                        {
+                            j = (j + 1) & (cap - 1);
+                        }
+                        table[j].1.store(name, Relaxed);
+                    }
+                });
             }
-            let key = v.key.load(Relaxed);
-            let name = self.0[self.root(i)].key.load(Relaxed);
-            let mut j = key as usize & (cap - 1);
-            while table[j].0 != 0 {
-                j = (j + 1) & (cap - 1);
-            }
-            table[j] = (key, name);
-        }
-        Aliases { table }
+        });
+        aliases
     }
 }
-
 pub struct Aliases {
-    table: Vec<(Key, Key)>,
+    table: Vec<(AtomicU64, AtomicU64)>,
 }
 impl Aliases {
+    fn empty(n: usize) -> Self {
+        Self {
+            table: (0..n)
+                .map(|_| (AtomicU64::new(0), AtomicU64::new(0)))
+                .collect(),
+        }
+    }
     #[inline]
     pub fn prefetch(&self, k: Key) {
         let i = k as usize & (self.table.len() - 1);
@@ -346,9 +371,10 @@ impl Aliases {
         let mask = self.table.len() - 1;
         let mut i = k as usize & mask;
         loop {
-            let (key, name) = self.table[i];
+            let (slot, name) = &self.table[i];
+            let key = slot.load(Relaxed);
             if key == k {
-                return name;
+                return name.load(Relaxed);
             }
             if key == 0 {
                 return k;
@@ -391,7 +417,7 @@ mod tests {
                 });
             }
         });
-        let got = graph.freeze();
+        let got = graph.freeze(4);
         for k in names {
             assert_eq!(got.canonical(mix(k)), expected.canonical(mix(k)));
         }

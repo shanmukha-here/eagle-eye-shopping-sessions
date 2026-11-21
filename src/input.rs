@@ -145,6 +145,26 @@ impl Input {
     pub fn bytes(&self) -> usize {
         self.0.iter().map(|s| s.mapping.len()).sum()
     }
+    pub fn release(self) {
+        // A single unmap of a large resident shard can hold the process mmap
+        // lock while other workers need it for page faults. Clear the private
+        // page-table entries in smaller ranges before the mapping is dropped.
+        const WINDOW: usize = 8 << 20;
+        for source in self.0 {
+            if source.direct.is_none() && source.mapping.len() > WINDOW {
+                for off in (0..source.mapping.len()).step_by(WINDOW) {
+                    // Data are read-only and the scanner has already joined.
+                    unsafe {
+                        let _ = source.mapping.unchecked_advise_range(
+                            memmap2::UncheckedAdvice::DontNeed,
+                            off,
+                            (source.mapping.len() - off).min(WINDOW),
+                        );
+                    }
+                }
+            }
+        }
+    }
     pub fn prefetch(&self, lane: usize, lanes: usize) {
         for file in self.0.iter().skip(lane).step_by(lanes) {
             if file.direct.is_some() {

@@ -199,6 +199,8 @@ impl<T: EventTime> EventSink<T> for [Bucket<T>] {
     }
 }
 
+#[cold]
+#[inline(never)]
 fn events<T: EventTime>(
     chunk: &[u8],
     dates: &mut Dates,

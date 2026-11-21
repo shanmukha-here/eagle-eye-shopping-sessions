@@ -254,6 +254,30 @@ unsafe fn next_lf(p: Ptr, limit: Ptr) -> Ptr {
     }
 }
 
+#[inline(always)]
+unsafe fn next_lf64(p: Ptr, limit: Ptr) -> Ptr {
+    unsafe {
+        let lf = _mm256_set1_epi8(10);
+        let available = limit.offset_from(p) as usize;
+        for offset in [0, 64] {
+            if available < offset + 64 {
+                break;
+            }
+            let block = p.add(offset);
+            let lo = _mm256_loadu_si256(block.cast());
+            let hi = _mm256_loadu_si256(block.add(32).cast());
+            let low = _mm256_movemask_epi8(_mm256_cmpeq_epi8(lo, lf)) as u32;
+            let high = _mm256_movemask_epi8(_mm256_cmpeq_epi8(hi, lf)) as u32;
+            let ends = u64::from(low) | (u64::from(high) << 32);
+            if ends != 0 {
+                return block.add(ends.trailing_zeros() as usize);
+            }
+        }
+        let end = libc::memchr(p.cast(), 10, available);
+        if end.is_null() { limit } else { end.cast() }
+    }
+}
+
 /// The two tail fields share one vector load. Its live prefix excludes LF.
 /// Purchases go through the precise price/category reader.
 #[inline(always)]
@@ -451,6 +475,56 @@ unsafe fn event_loop<const LEVEL: usize, T: EventTime>(
     }
 }
 
+#[target_feature(enable = "avx2")]
+unsafe fn event_cursors<const N: usize, T: EventTime>(
+    data: &[u8],
+    date: &mut Dates,
+    keys: &Keys,
+    catalog: &Catalog,
+    state: State<'_>,
+    emit: &mut (impl EventSink<T> + ?Sized),
+) -> [usize; 2] {
+    unsafe {
+        let base = data.as_ptr();
+        let limit = base.add(data.len());
+        let mut cursor = [base; N];
+        let mut ends = [limit; N];
+        for i in 1..N {
+            let at = base.add(data.len() * i / N);
+            let lf = next_lf64(at, limit);
+            cursor[i] = lf.add(usize::from(lf < limit));
+            ends[i - 1] = cursor[i];
+        }
+        let mut count = [0, 0];
+        loop {
+            let mut active = false;
+            for i in 0..N {
+                let p = cursor[i];
+                if p >= ends[i] {
+                    continue;
+                }
+                active = true;
+                let end = next_lf64(p, ends[i]);
+                let following = end.add(usize::from(end < ends[i]));
+                if limit.offset_from(p) >= 128
+                    && end.offset_from(p) >= 50
+                    && event::<7, T>(p, end, state, emit)
+                {
+                    count[0] += 1;
+                } else {
+                    count[1] += 1;
+                    let row = std::slice::from_raw_parts(p, following.offset_from(p) as usize);
+                    crate::events(row, date, keys, catalog, state.start, state.end, emit);
+                }
+                cursor[i] = following;
+            }
+            if !active {
+                return count;
+            }
+        }
+    }
+}
+
 pub(super) fn events<T: EventTime>(
     data: &[u8],
     date: &mut Dates,
@@ -463,8 +537,16 @@ pub(super) fn events<T: EventTime>(
     level: usize,
 ) -> [usize; 2] {
     let state = State { clock, start, end };
-    // Each fixed path uses the same bounds and vector dispatch.
+    // The caller has checked AVX2. Keep the probe checkpoints consistent.
     unsafe {
+        if level == 7 {
+            match std::env::var("SHOPPING_ROW_CURSORS").as_deref() {
+                Ok("1") => return event_cursors::<1, T>(data, date, keys, catalog, state, emit),
+                Ok("2") => return event_cursors::<2, T>(data, date, keys, catalog, state, emit),
+                Ok("3") => return event_cursors::<3, T>(data, date, keys, catalog, state, emit),
+                _ => {}
+            }
+        }
         match level {
             0 => event_loop::<0, T>(data, date, keys, catalog, state, emit),
             1 => event_loop::<1, T>(data, date, keys, catalog, state, emit),

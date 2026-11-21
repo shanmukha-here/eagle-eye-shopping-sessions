@@ -6,6 +6,7 @@ mod input;
 mod keys;
 mod output;
 mod pages;
+mod persistence;
 mod raw;
 
 use aggregate::{Click, Event, SmallEvent, Stats, Stored, Totals};
@@ -439,6 +440,14 @@ fn usage() -> (f64, f64, i64, i64, i64) {
 
 fn main() {
     let data = PathBuf::from(env::var_os("DATA_DIR").unwrap_or_else(|| "/data".into()));
+    match persistence::check(&data) {
+        Ok(Some(code)) => std::process::exit(code),
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!("persistence probe setup failed: {err}");
+            std::process::exit(74);
+        }
+    }
     let out = PathBuf::from(env::var_os("OUTPUT_DIR").unwrap_or_else(|| "/output".into()));
     let threads = env::var("NCPU")
         .ok()

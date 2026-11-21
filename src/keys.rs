@@ -28,11 +28,14 @@ const NINTH: [u64; 128] = ninth_table();
 
 #[inline]
 pub fn mix(mut k: u64) -> u64 {
-    k ^= k >> 30;
-    k = k.wrapping_mul(0xbf58476d1ce4e5b9);
-    k ^= k >> 27;
-    k = k.wrapping_mul(0x94d049bb133111eb);
-    k ^ (k >> 31)
+    k ^= k >> 32;
+    k.wrapping_mul(0x9e3779b97f4a7c15).rotate_left(27)
+}
+
+#[inline(always)]
+pub fn unmix(k: u64) -> u64 {
+    let x = k.rotate_right(27).wrapping_mul(0xf1de83e19937733d);
+    x ^ (x >> 32)
 }
 #[derive(Default)]
 pub struct IntHash(u64);
@@ -59,7 +62,7 @@ struct Long {
 #[derive(Default)]
 pub struct Keys(Mutex<Long>);
 impl Keys {
-    #[inline]
+    #[inline(always)]
     pub fn key(&self, s: &[u8]) -> Key {
         if (8..=9).contains(&s.len()) {
             let word = u64::from_be_bytes(s[..8].try_into().unwrap());
@@ -67,6 +70,15 @@ impl Keys {
             let zero = word.wrapping_sub(0x0101010101010101) & !word & !LOW;
             if word & !LOW == 0 && zero == 0 && last < 128 && (last != 0 || s.len() == 8) {
                 return word | NINTH[last as usize];
+            }
+        } else if (4..8).contains(&s.len()) {
+            let first = u32::from_be_bytes(s[..4].try_into().unwrap());
+            let last = u32::from_be_bytes(s[s.len() - 4..].try_into().unwrap());
+            let bytes = (u64::from(first) << 32) | u64::from(last);
+            if (bytes & !LOW) == 0 && (bytes.wrapping_sub(0x0101010101010101) & !bytes & !LOW) == 0
+            {
+                return (u64::from(first) << 32)
+                    | ((u64::from(last) << (8 * (8 - s.len()))) & 0xffffffff);
             }
         } else if s.len() < 8 && s.iter().all(|&b| b > 0 && b < 128) {
             let mut bytes = [0; 8];
@@ -183,7 +195,9 @@ impl People {
             if key == name {
                 continue;
             }
-            let mut i = mix(key) as usize & (cap - 1);
+            let key = mix(key);
+            let name = mix(name);
+            let mut i = key as usize & (cap - 1);
             while table[i].0 != 0 {
                 i = (i + 1) & (cap - 1);
             }
@@ -198,7 +212,7 @@ pub struct Aliases {
 impl Aliases {
     #[inline]
     pub fn prefetch(&self, k: Key) {
-        let i = mix(k) as usize & (self.table.len() - 1);
+        let i = k as usize & (self.table.len() - 1);
         unsafe {
             std::arch::x86_64::_mm_prefetch(
                 self.table.as_ptr().add(i).cast(),
@@ -209,7 +223,7 @@ impl Aliases {
     #[inline]
     pub fn canonical(&self, k: Key) -> Key {
         let mask = self.table.len() - 1;
-        let mut i = mix(k) as usize & mask;
+        let mut i = k as usize & mask;
         loop {
             let (key, name) = self.table[i];
             if key == k {
@@ -225,7 +239,14 @@ impl Aliases {
 
 #[cfg(test)]
 mod tests {
-    use super::Keys;
+    use super::{Keys, mix, unmix};
+    #[test]
+    fn hash_permutation_round_trips() {
+        for n in 0u64..50_000 {
+            let k = n.wrapping_mul(0x9d37aa75229103dd);
+            assert_eq!(unmix(mix(k)), k);
+        }
+    }
     #[test]
     fn output_names_round_trip() {
         let keys = Keys::default();

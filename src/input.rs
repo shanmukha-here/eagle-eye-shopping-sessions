@@ -14,13 +14,23 @@ pub fn jobs<T: Send, R: Send>(
     init: impl Fn(usize) -> R + Sync,
     process: impl Fn(&mut R, T) + Sync,
 ) -> Vec<R> {
+    jobs_finish(items, threads, init, process, |_, state| state)
+}
+pub fn jobs_finish<T: Send, R: Send, S: Send>(
+    items: Vec<T>,
+    threads: usize,
+    init: impl Fn(usize) -> R + Sync,
+    process: impl Fn(&mut R, T) + Sync,
+    finish: impl Fn(usize, R) -> S + Sync,
+) -> Vec<S> {
     let workers = threads.min(items.len()).max(1);
     let slots: Vec<_> = items.into_iter().map(|x| Mutex::new(Some(x))).collect();
     let next = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|i| {
-                let (init, process, slots, next) = (&init, &process, &slots, &next);
+                let (init, process, finish, slots, next) =
+                    (&init, &process, &finish, &slots, &next);
                 scope.spawn(move || {
                     let mut result = init(i);
                     loop {
@@ -29,7 +39,7 @@ pub fn jobs<T: Send, R: Send>(
                         let value = slot.lock().unwrap().take().unwrap();
                         process(&mut result, value);
                     }
-                    result
+                    finish(i, result)
                 })
             })
             .collect();
@@ -68,10 +78,10 @@ impl Input {
     pub fn bytes(&self) -> usize {
         self.0.iter().map(|m| m.len()).sum()
     }
-    pub fn prefetch(&self) {
-        for file in &self.0 {
+    pub fn prefetch(&self, lane: usize, lanes: usize) {
+        for file in self.0.iter().skip(lane).step_by(lanes) {
             // Linux caps a single speculative read. Queue the file in order.
-            const WINDOW: usize = 2 << 20;
+            const WINDOW: usize = 8 << 20;
             for off in (0..file.len()).step_by(WINDOW) {
                 let _ = file.advise_range(
                     memmap2::Advice::WillNeed,
@@ -152,48 +162,94 @@ unsafe fn rows_vector<const N: usize>(mut data: &[u8], mut emit: impl FnMut(&[&[
     // handles arbitrarily long records and the unpadded end of the mapping.
     while data.len() >= 128 {
         let (s0, l0, q0) = unsafe { mask64(data) };
-        let (seps, lf, quotes) = if l0 != 0 {
-            (s0 as u128, l0 as u128, q0 as u128)
+        let (mut lo, mut hi, qlo, qhi, end) = if l0 != 0 {
+            let live = l0 ^ l0.wrapping_sub(1);
+            (s0 & live, 0, q0 & live, 0, l0.trailing_zeros() as usize)
         } else {
-            let (s1, l1, q1) = unsafe { mask64(&data[64..]) };
+            let (a, b, c) = unsafe { masks(&data[64..]) };
+            let (s1, l1, q1) = if b != 0 {
+                (a as u64, b as u64, c as u64)
+            } else {
+                let (d, e, f) = unsafe { masks(&data[96..]) };
+                (
+                    a as u64 | ((d as u64) << 32),
+                    b as u64 | ((e as u64) << 32),
+                    c as u64 | ((f as u64) << 32),
+                )
+            };
             if l1 == 0 {
                 let end = data[128..]
                     .iter()
-                    .position(|&v| v == 10)
+                    .position(|&b| b == 10)
                     .map_or(data.len(), |p| 129 + p);
                 rows_body::<N, true>(&data[..end], &mut emit);
                 data = &data[end..];
                 continue;
             }
+            let live = l1 ^ l1.wrapping_sub(1);
             (
-                s0 as u128 | ((s1 as u128) << 64),
-                (l1 as u128) << 64,
-                q0 as u128 | ((q1 as u128) << 64),
+                s0,
+                s1 & live,
+                q0,
+                q1 & live,
+                64 + l1.trailing_zeros() as usize,
             )
         };
-        let end = lf.trailing_zeros() as usize;
-        let before = (lf & lf.wrapping_neg()) - 1;
-        let mut ds = seps & (before | (before + 1));
-        let q = quotes & before;
-        // Each quote must touch exactly one field boundary. Opening and
-        // closing quote flags must also match for each field, in order.
-        if ds.count_ones() == N as u32 && q & !(((ds << 1) | 1) ^ (ds >> 1)) == 0 {
-            let extract = |v: u128| unsafe {
-                _pext_u64(v as u64, ds as u64)
-                    | (_pext_u64((v >> 64) as u64, (ds >> 64) as u64) << (ds as u64).count_ones())
-            };
-            let mut wraps = ((extract(q >> 1) << 1) | (q as u64 & 1)) & ((1 << N) - 1);
-            if wraps == extract(q << 1) {
+        let nlo = lo.count_ones();
+        if nlo + hi.count_ones() == N as u32 {
+            let mut wraps = 0;
+            let mut valid = true;
+            if qlo | qhi != 0 {
+                let left_lo = (lo << 1) | 1;
+                let right_lo = (lo >> 1) | (hi << 63);
+                let left_hi = (hi << 1) | (lo >> 63);
+                let right_hi = hi >> 1;
+                valid = (qlo & !(left_lo ^ right_lo)) | (qhi & !(left_hi ^ right_hi)) == 0;
+                let gather = |l, h| unsafe { _pext_u64(l, lo) | (_pext_u64(h, hi) << nlo) };
+                wraps = ((gather((qlo >> 1) | (qhi << 63), qhi >> 1) << 1) | (qlo & 1))
+                    & ((1 << N) - 1);
+                valid &= wraps == gather(qlo << 1, (qhi << 1) | (qlo >> 63));
+            }
+            if valid {
                 let mut fields = [&data[..0]; N];
-                let mut a = 0;
-                for field in &mut fields {
-                    let b = ds.trailing_zeros() as usize;
-                    let trim = wraps as usize & 1;
-                    // Masks above prove each trimmed field has two distinct quotes.
-                    *field = &data[a + trim..b - trim];
-                    a = b + 1;
-                    ds &= ds - 1;
-                    wraps >>= 1;
+                let mut start = 0;
+                // The quote masks prove that each pair belongs to one nonempty
+                // field. Each bit below denotes a real separator in this row.
+                macro_rules! field {
+                    ($i:expr,$m:ident,$base:expr) => {{
+                        let at = $base + $m.trailing_zeros() as usize;
+                        let trim = ((wraps >> $i) & 1) as usize;
+                        fields[$i] = unsafe { data.get_unchecked(start + trim..at - trim) };
+                        start = at + 1;
+                        $m &= $m - 1;
+                    }};
+                }
+                // Keep the low and high bit scans independent on long records.
+                if nlo as usize == N {
+                    for i in 0..N {
+                        field!(i, lo, 0);
+                    }
+                } else if N == 7 && nlo == 4 {
+                    for i in 0..4 {
+                        field!(i, lo, 0);
+                    }
+                    for i in 4..7 {
+                        field!(i, hi, 64);
+                    }
+                } else if N == 7 && nlo == 3 {
+                    for i in 0..3 {
+                        field!(i, lo, 0);
+                    }
+                    for i in 3..7 {
+                        field!(i, hi, 64);
+                    }
+                } else {
+                    for i in 0..nlo as usize {
+                        field!(i, lo, 0);
+                    }
+                    for i in nlo as usize..N {
+                        field!(i, hi, 64);
+                    }
                 }
                 emit(&fields);
             }
@@ -361,7 +417,7 @@ impl Dates {
             slots: [([0; 10], INVALID); 128],
         }
     }
-    #[inline]
+    #[inline(always)]
     fn day(&mut self, s: &[u8]) -> Option<i64> {
         let key: &[u8; 10] = s[..10].try_into().unwrap();
         let index = (s[9] as usize + 11 * s[8] as usize + 33 * s[6] as usize) & 127;
@@ -369,63 +425,88 @@ impl Dates {
         if entry.0 == *key && entry.1 != INVALID {
             return Some(entry.1);
         }
-        if s[4] != 45 || s[7] != 45 {
+        Self::fill_day(key, entry)
+    }
+    #[cold]
+    fn fill_day(key: &[u8; 10], entry: &mut ([u8; 10], i64)) -> Option<i64> {
+        if key[4] != 45 || key[7] != 45 {
             return None;
         }
-        let day = civil_day(two(s, 0)? * 100 + two(s, 2)?, two(s, 5)?, two(s, 8)?)? * DAY;
+        let day = civil_day(
+            two(key, 0)? * 100 + two(key, 2)?,
+            two(key, 5)?,
+            two(key, 8)?,
+        )? * DAY;
         *entry = (*key, day);
         Some(day)
     }
-    // Ingest time is guaranteed to be a valid, whole-second UTC timestamp.
-    #[inline]
-    pub fn ingest(&mut self, s: &[u8]) -> i64 {
-        let hour = 10 * s[11] as i64 + s[12] as i64 - 528;
-        let minute = 10 * s[14] as i64 + s[15] as i64 - 528;
-        let second = 10 * s[17] as i64 + s[18] as i64 - 528;
-        self.day(s).unwrap() + ((hour * 60 + minute) * 60 + second) * 1000
+    #[inline(always)]
+    pub fn event_times(&mut self, event: &[u8], ingest: &[u8]) -> (Option<i64>, i64) {
+        let day = self.day(ingest).unwrap();
+        let arrival = day + Self::hms::<false>(ingest).unwrap();
+        let instant = if event.len() == 20
+            && event[10] == b'T'
+            && event[19] == b'Z'
+            && event[..10] == ingest[..10]
+        {
+            Self::hms::<true>(event).map(|millis| day + millis)
+        } else {
+            self.stamp(event)
+        };
+        (instant, arrival)
     }
-    #[inline]
+    #[inline(always)]
+    fn hms<const CHECK: bool>(s: &[u8]) -> Option<i64> {
+        let word =
+            u64::from_le_bytes(s[11..19].try_into().unwrap()) ^ u64::from_le_bytes(*b"00:00:00");
+        const DIGITS: u64 = 0x0f0f000f0f000f0f;
+        if CHECK
+            && (word & !DIGITS != 0
+                || word.wrapping_add(0x0606000606000606) & 0x1010001010001010 != 0)
+        {
+            return None;
+        }
+        let pairs = (word.wrapping_mul(10).wrapping_add(word >> 8)) & 0xff0000ff0000ff;
+        if CHECK && pairs.wrapping_add((68u64 << 48) | (68u64 << 24) | 104) & 0x80000080000080 != 0
+        {
+            return None;
+        }
+        let seconds = (pairs & 255) * 3600 + ((pairs >> 24) & 255) * 60 + (pairs >> 48);
+        Some(seconds as i64 * 1000)
+    }
+    #[inline(always)]
+    fn digits8(w: u64) -> Option<u32> {
+        let raw = w ^ 0x3030303030303030;
+        if (raw & 0xf0f0f0f0f0f0f0f0) != 0
+            || (raw.wrapping_add(0x0606060606060606) & 0x1010101010101010) != 0
+        {
+            return None;
+        }
+        let pairs = (raw.wrapping_mul(10).wrapping_add(raw >> 8)) & 0x00ff00ff00ff00ff;
+        let quads = (pairs.wrapping_mul(100).wrapping_add(pairs >> 16)) & 0x0000ffff0000ffff;
+        Some(quads.wrapping_mul(10000).wrapping_add(quads >> 32) as u32)
+    }
+    #[inline(always)]
     fn epoch(s: &[u8]) -> Option<i64> {
         // Decode a full eight-digit word with three pairwise multiply-adds.
         // Other lengths, including arbitrary leading zeros, use checked decimal.
         if s.len() == 13 {
-            let w = u64::from_le_bytes(s[..8].try_into().unwrap());
-            let raw = w ^ 0x3030303030303030;
-            if (raw & 0xf0f0f0f0f0f0f0f0) != 0
-                || (raw.wrapping_add(0x0606060606060606) & 0x1010101010101010) != 0
-            {
-                return None;
-            }
-            let pairs = (raw.wrapping_mul(10) + (raw >> 8)) & 0x00ff00ff00ff00ff;
-            let quads = (pairs.wrapping_mul(100) + (pairs >> 16)) & 0x0000ffff0000ffff;
-            let high = (quads * 10000 + (quads >> 32)) as u32;
-            let mut low = 0;
-            for &v in &s[8..] {
-                let d = v.wrapping_sub(48);
-                if d > 9 {
-                    return None;
-                }
-                low = low * 10 + d as i64;
-            }
-            return Some(high as i64 * 100000 + low);
+            let high = Self::digits8(u64::from_le_bytes(s[..8].try_into().unwrap()))?;
+            let last = u64::from_le_bytes(s[5..].try_into().unwrap());
+            let low = Self::digits8((last & !0xffffff) | 0x303030)?;
+            return Some(high as i64 * 100000 + low as i64);
         }
         decimal(s, i64::MAX as u64).map(|v| v as i64)
     }
-    #[inline]
+    #[inline(always)]
     pub fn stamp(&mut self, s: &[u8]) -> Option<i64> {
         if (s.len() != 20 && s.len() != 25) || s[4] != 45 {
             return Self::epoch(s);
         }
-        if s[10] != 84 || s[13] != 58 || s[16] != 58 {
+        if s[10] != 84 {
             return None;
         }
-        let hour = two(s, 11)?;
-        let minute = two(s, 14)?;
-        let second = two(s, 17)?;
-        if hour > 23 || minute > 59 || second > 59 {
-            return None;
-        }
-        let local = self.day(s)? + ((hour * 60 + minute) * 60 + second) * 1000;
+        let local = self.day(s)? + Self::hms::<true>(s)?;
         if s.len() == 20 {
             return (s[19] == 90).then_some(local);
         }
@@ -539,6 +620,58 @@ mod tests {
         check::<2>(&data);
         check::<4>(&data);
         check::<7>(&data);
+    }
+    #[test]
+    fn time_of_day_word_validation() {
+        let mut word = *b"2001-02-03T12:34:56Z";
+        for i in 11..19 {
+            let old = word[i];
+            for byte in 0..=255 {
+                word[i] = byte;
+                let expected = (|| {
+                    if word[13] != b':' || word[16] != b':' {
+                        return None;
+                    }
+                    let h = two(&word, 11)?;
+                    let m = two(&word, 14)?;
+                    let s = two(&word, 17)?;
+                    (h < 24 && m < 60 && s < 60).then_some(((h * 60 + m) * 60 + s) * 1000)
+                })();
+                assert_eq!(Dates::hms::<true>(&word), expected);
+            }
+            word[i] = old;
+        }
+    }
+    #[test]
+    fn variable_length_rows_match_scalar_oracle() {
+        let mut state = 5u32;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            state
+        };
+        let mut buf = Vec::new();
+        for _ in 0..6000 {
+            let n = 2 + next() as usize % 8;
+            for field in 0..n {
+                if field > 0 {
+                    buf.push(b',');
+                }
+                let quoted = next() % 3 == 0;
+                if quoted {
+                    buf.push(b'"');
+                }
+                for _ in 0..next() % 32 {
+                    buf.push(if next() % 97 == 0 { b'"' } else { b'x' });
+                }
+                if quoted {
+                    buf.push(b'"');
+                }
+            }
+            buf.push(10);
+        }
+        check::<2>(&buf);
+        check::<4>(&buf);
+        check::<7>(&buf);
     }
     #[test]
     fn epoch_word_parser_matches_checked_digits() {

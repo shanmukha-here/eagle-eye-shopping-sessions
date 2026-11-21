@@ -45,43 +45,116 @@ pub struct UserRow {
 }
 pub struct Totals {
     pub users: Vec<UserRow>,
-    pub campaigns: BTreeMap<i32, Vec<Stats>>,
+    origin: i64,
+    packed: bool,
+    base_day: i32,
+    dense_days: Vec<Vec<Stats>>,
+    campaigns: BTreeMap<i32, Vec<Stats>>,
     category_cents: Vec<i64>,
     touched: Vec<u32>,
     counts: Vec<u32>,
     active: Vec<u32>,
     positions: Vec<usize>,
 }
-// Higher hash bits distribute users independently of the outer person shard.
-// People in different bins cannot share sessions. Only the small residual
-// bins need comparison sorting, and whales still fit into one timeline.
-fn radix_groups<T: Copy + Default>(
-    parts: Vec<Vec<T>>,
-    user: impl Fn(&T) -> Key,
-) -> (Vec<T>, [usize; 128]) {
-    let mut ends = [0usize; 128];
-    let bin = |r: &T| (crate::keys::mix(user(r)) >> 20) as usize & 127;
-    for r in parts.iter().flatten() {
-        ends[bin(r)] += 1;
-    }
-    let mut total = 0;
-    for e in &mut ends {
-        let n = *e;
-        *e = total;
-        total += n;
-    }
-    let mut grouped = vec![T::default(); total];
-    for r in parts.into_iter().flatten() {
-        let off = &mut ends[bin(&r)];
-        grouped[*off] = r;
-        *off += 1;
-    }
-    (grouped, ends)
+#[derive(Clone, Copy, Default)]
+struct IndexSlot {
+    key: Key,
+    index: usize,
 }
+
+fn position(table: &[IndexSlot], key: Key) -> usize {
+    let mask = table.len() - 1;
+    let mut i = (key >> 16) as usize & mask;
+    while table[i].key != 0 && table[i].key != key {
+        i = (i + 1) & mask;
+    }
+    i
+}
+#[derive(Default, Clone, Copy)]
+struct Moment {
+    t: i64,
+    cents: u32,
+    cat: u32,
+}
+// A short reporting window and a small category catalog fit a complete event
+// in one sortable word. The generic record covers every other manifest.
+trait Observation: Copy + Default {
+    fn new(event: Event, origin: i64) -> Self;
+    fn time(self, origin: i64) -> i64;
+    fn cents(self) -> u32;
+    fn category(self) -> u32;
+    fn order(values: &mut [Self]);
+}
+impl Observation for u64 {
+    #[inline(always)]
+    fn new(e: Event, origin: i64) -> Self {
+        ((e.t - origin) as u64) << 32 | ((e.cat as u64) << 24) | e.cents as u64
+    }
+    #[inline(always)]
+    fn time(self, origin: i64) -> i64 {
+        origin + (self >> 32) as i64
+    }
+    #[inline(always)]
+    fn cents(self) -> u32 {
+        (self as u32) & 0xffffff
+    }
+    #[inline(always)]
+    fn category(self) -> u32 {
+        (self as u32) >> 24
+    }
+    fn order(values: &mut [Self]) {
+        values.sort_unstable();
+    }
+}
+impl Observation for Moment {
+    #[inline(always)]
+    fn new(e: Event, _: i64) -> Self {
+        Self {
+            t: e.t,
+            cents: e.cents,
+            cat: e.cat,
+        }
+    }
+    #[inline(always)]
+    fn time(self, _: i64) -> i64 {
+        self.t
+    }
+    #[inline(always)]
+    fn cents(self) -> u32 {
+        self.cents
+    }
+    #[inline(always)]
+    fn category(self) -> u32 {
+        self.cat
+    }
+    fn order(values: &mut [Self]) {
+        values.sort_unstable_by_key(|e| e.t);
+    }
+}
+
+#[derive(Default, Clone, Copy)]
+struct Touch {
+    t: i64,
+    id: Key,
+    campaign: u32,
+}
+
 impl Totals {
-    pub fn new(cats: usize, camps: usize) -> Self {
+    pub fn new(cats: usize, camps: usize, start: i64, end: i64) -> Self {
+        let base_day = start.div_euclid(DAY) as i32;
+        let len =
+            (end.saturating_sub(1).div_euclid(DAY) - base_day as i64 + 1).clamp(0, i32::MAX as i64);
+        let dense_days = if len <= 128 {
+            vec![Vec::new(); len as usize]
+        } else {
+            Vec::new()
+        };
         Self {
             users: Vec::new(),
+            origin: start,
+            packed: end.saturating_sub(start) <= u32::MAX as i64 && cats <= 256,
+            base_day,
+            dense_days,
             campaigns: BTreeMap::new(),
             category_cents: vec![0; cats],
             touched: Vec::new(),
@@ -89,6 +162,15 @@ impl Totals {
             active: Vec::new(),
             positions: vec![0; camps],
         }
+    }
+    pub fn days(self) -> BTreeMap<i32, Vec<Stats>> {
+        let mut days = self.campaigns;
+        for (i, stats) in self.dense_days.into_iter().enumerate() {
+            if !stats.is_empty() {
+                days.insert(self.base_day + i as i32, stats);
+            }
+        }
+        days
     }
     fn finish_day(&mut self, mut row: UserRow) {
         let mut best = 0;
@@ -120,11 +202,10 @@ impl Totals {
             }
         }
     }
-    fn person(&mut self, keys: &Keys, events: &[Event], clicks: &[Click]) {
-        let u = events[0].u;
+    fn person<M: Observation>(&mut self, keys: &Keys, u: Key, events: &[M], clicks: &[Touch]) {
         let mut row = UserRow {
             u,
-            day: events[0].t.div_euclid(DAY) as i32,
+            day: events[0].time(self.origin).div_euclid(DAY) as i32,
             ..Default::default()
         };
         let (mut at, mut left, mut right) = (0, 0, 0);
@@ -132,7 +213,7 @@ impl Totals {
         let mut winner = 0;
         let mut winner_id = 0;
         while at < events.len() {
-            let start = events[at].t;
+            let start = events[at].time(self.origin);
             let day = start.div_euclid(DAY) as i32;
             if row.day != day {
                 self.finish_day(row);
@@ -146,16 +227,18 @@ impl Totals {
             let mut revenue = 0;
             loop {
                 let e = events[at];
-                if e.cents > 0 {
-                    let value = &mut self.category_cents[e.cat as usize];
+                if e.cents() > 0 {
+                    let value = &mut self.category_cents[e.category() as usize];
                     if *value == 0 {
-                        self.touched.push(e.cat);
+                        self.touched.push(e.category());
                     }
-                    *value += e.cents as i64;
-                    revenue += e.cents as i64;
+                    *value += e.cents() as i64;
+                    revenue += e.cents() as i64;
                 }
                 at += 1;
-                if at == events.len() || events[at].t - e.t > 1_800_000 {
+                if at == events.len()
+                    || events[at].time(self.origin) - e.time(self.origin) > 1_800_000
+                {
                     break;
                 }
             }
@@ -176,10 +259,17 @@ impl Totals {
                 self.expire(clicks[left].campaign);
                 left += 1;
             }
-            let stats = self
-                .campaigns
-                .entry(day)
-                .or_insert_with(|| vec![Stats::default(); self.counts.len()]);
+            let stats = if !self.dense_days.is_empty() {
+                let stats = &mut self.dense_days[(day - self.base_day) as usize];
+                if stats.is_empty() {
+                    stats.resize(self.counts.len(), Stats::default());
+                }
+                stats
+            } else {
+                self.campaigns
+                    .entry(day)
+                    .or_insert_with(|| vec![Stats::default(); self.counts.len()])
+            };
             let credit = if self.active.is_empty() {
                 0
             } else {
@@ -198,35 +288,87 @@ impl Totals {
         }
     }
     pub fn partition(&mut self, keys: &Keys, events: Vec<Vec<Event>>, clicks: Vec<Vec<Click>>) {
-        let (mut events, ee) = radix_groups(events, |r| r.u);
-        let (mut clicks, ce) = radix_groups(clicks, |r| r.u);
-        let (mut ep, mut cp) = (0, 0);
-        for bin in 0..ee.len() {
-            let es = &mut events[ep..ee[bin]];
-            let cs = &mut clicks[cp..ce[bin]];
-            es.sort_unstable_by_key(|e| (e.u, e.t));
-            cs.sort_unstable_by_key(|c| (c.u, c.t));
-            self.timelines(keys, es, cs);
-            ep = ee[bin];
-            cp = ce[bin];
+        if self.packed {
+            self.partition_inner::<u64>(keys, events, clicks)
+        } else {
+            self.partition_inner::<Moment>(keys, events, clicks)
         }
     }
-    fn timelines(&mut self, keys: &Keys, events: &[Event], clicks: &[Click]) {
-        let (mut i, mut j) = (0, 0);
-        while i < events.len() {
-            let start = i;
-            let u = events[i].u;
-            while i < events.len() && events[i].u == u {
-                i += 1;
+    fn partition_inner<M: Observation>(
+        &mut self,
+        keys: &Keys,
+        mut events: Vec<Vec<Event>>,
+        mut clicks: Vec<Vec<Click>>,
+    ) {
+        let ne = events.iter().map(Vec::len).sum::<usize>();
+        if ne == 0 {
+            return;
+        }
+        let mut table = vec![IndexSlot::default(); (ne / 12 + 8).next_power_of_two()];
+        let mut groups: Vec<(Key, usize, usize)> = Vec::new();
+        for e in events.iter_mut().flatten() {
+            let i = position(&table, e.u);
+            if table[i].key == 0 {
+                table[i] = IndexSlot {
+                    key: e.u,
+                    index: groups.len(),
+                };
+                groups.push((crate::keys::unmix(e.u), 0, 0));
             }
-            while j < clicks.len() && clicks[j].u < u {
-                j += 1;
+            let index = table[i].index;
+            groups[index].1 += 1;
+            e.u = index as u64;
+            if groups.len() * 4 >= table.len() * 3 {
+                let n = table.len() * 2;
+                let old = std::mem::replace(&mut table, vec![IndexSlot::default(); n]);
+                for s in old.into_iter().filter(|s| s.key != 0) {
+                    let i = position(&table, s.key);
+                    table[i] = s;
+                }
             }
-            let click_start = j;
-            while j < clicks.len() && clicks[j].u == u {
-                j += 1;
+        }
+        for c in clicks.iter_mut().flatten() {
+            let s = table[position(&table, c.u)];
+            if s.key != 0 {
+                groups[s.index].2 += 1;
+                c.u = s.index as u64;
+            } else {
+                c.u = u64::MAX;
             }
-            self.person(keys, &events[start..i], &clicks[click_start..j]);
+        }
+        let (mut eoff, mut coff) = (0, 0);
+        for (_, e, c) in &mut groups {
+            let (ne, nc) = (*e, *c);
+            *e = eoff;
+            *c = coff;
+            eoff += ne;
+            coff += nc;
+        }
+        let mut es = vec![M::default(); ne];
+        let mut cs = vec![Touch::default(); coff];
+        for e in events.into_iter().flatten() {
+            let i = &mut groups[e.u as usize].1;
+            es[*i] = M::new(e, self.origin);
+            *i += 1;
+        }
+        for c in clicks.into_iter().flatten().filter(|c| c.u != u64::MAX) {
+            let i = &mut groups[c.u as usize].2;
+            cs[*i] = Touch {
+                t: c.t,
+                id: c.id,
+                campaign: c.campaign,
+            };
+            *i += 1;
+        }
+        let (mut e, mut c) = (0, 0);
+        for (user, end_e, end_c) in groups {
+            let events = &mut es[e..end_e];
+            let clicks = &mut cs[c..end_c];
+            M::order(events);
+            clicks.sort_unstable_by_key(|c| c.t);
+            self.person(keys, user, events, clicks);
+            e = end_e;
+            c = end_c;
         }
     }
 }

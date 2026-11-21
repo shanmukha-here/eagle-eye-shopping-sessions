@@ -1,5 +1,7 @@
 """Time fresh processes. Validate output outside the clock on every run."""
 import os
+import fcntl
+import resource
 import ctypes
 import mmap
 import uuid
@@ -15,6 +17,7 @@ from pathlib import Path
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
+from board_model import select as select_model, estimate
 
 data = Path(os.environ["BOARD_DATA"])
 image = os.environ.get("BOARD_IMAGE")
@@ -23,7 +26,7 @@ if image:
     if metadata["Os"] != "linux" or metadata["Architecture"] != "amd64" or metadata["Size"] > 8_000_000_000:
         sys.exit("invalid image platform or size")
 # Fit separate cold measurements on each host. Never apply a warm fit to cold data.
-calibration = data / ("docker-calibration.json" if image else "native-calibration.json")
+calibration = data / ("docker-cpu-calibration.json" if image else "native-cpu-calibration.json")
 calibrate = sys.argv[1:] == ["--calibrate"]
 quick = sys.argv[1:] == ["--trial"]
 tuning = sys.argv[1:] == ["--tune"]
@@ -38,6 +41,27 @@ assert int((cg/"memory.max").read_text()) == 24 * 1024**3
 assert int((cg/"memory.swap.max").read_text()) == 0
 assert (cg/"cpu.max").read_text().split() == ["800000", "100000"]
 assert int((cg/"pids.max").read_text()) == 4096
+
+
+# Docker keeps the systemd parent slice after its container cgroup disappears.
+# Its cumulative CPU charge includes every worker and the process exit path.
+slice_name = f"shoppingboard{os.getuid()}.slice"
+if image:
+    lock_file = Path(os.environ["XDG_RUNTIME_DIR"]) / "shopping-localboard.lock"
+    clock_lock = lock_file.open("a")
+    fcntl.flock(clock_lock, fcntl.LOCK_EX)
+    if subprocess.check_output(["docker", "info", "--format", "{{.CgroupDriver}}"], text=True).strip() != "systemd":
+        sys.exit("Docker CPU profiling requires the systemd cgroup driver")
+
+
+def cpu_seconds():
+    if image:
+        stat = Path("/sys/fs/cgroup") / slice_name / "cpu.stat"
+        if not stat.exists():
+            return 0.0
+        return int(dict(line.split() for line in stat.read_text().splitlines())["usage_usec"]) / 1e6
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return usage.ru_utime + usage.ru_stime
 
 
 def evict(inp):
@@ -99,7 +123,7 @@ def command(inp, out, scratch):
     out.chmod(0o777)
     scratch.chmod(0o777)
     container = "shopping-local-" + uuid.uuid4().hex
-    args = ["docker", "run", "--name", container, "--platform", "linux/amd64", "--cpus", "8",
+    args = ["docker", "run", "--cgroup-parent", slice_name, "--name", container, "--platform", "linux/amd64", "--cpus", "8",
             "--cpuset-cpus", ",".join(map(str, sorted(os.sched_getaffinity(0)))),
             "--memory", "24g", "--memory-swap", "24g", "--pids-limit", "4096",
             "--network", "none", "--read-only", "--user", "1000:1000",
@@ -138,6 +162,7 @@ def run(name, inp, answer, limit, allow_cutoff=False):
                          SCRATCH_DIR=str(scratch), HOME=str(scratch), TMPDIR=str(scratch))
         with command(inp, out, scratch) as (argv, container), (base / "stdout").open("wb") as stdout, (base / "stderr").open("wb") as stderr:
             pages = evict(inp)
+            cpu_start = cpu_seconds()
             start = time.perf_counter()
             proc = subprocess.Popen(argv, env=execution, cwd=scratch,
                                     stdout=stdout, stderr=stderr, start_new_session=True)
@@ -168,6 +193,7 @@ def run(name, inp, answer, limit, allow_cutoff=False):
                 if proc.poll() is None:
                     os.killpg(proc.pid, signal.SIGKILL)
                     proc.wait()
+            used_cpu = cpu_seconds() - cpu_start
             if container:
                 state = docker_state(container)
                 rc = rc or state["ExitCode"] or int(state["OOMKilled"])
@@ -187,33 +213,34 @@ def run(name, inp, answer, limit, allow_cutoff=False):
         if name in ("practice", "final"):
             stages = (base / "stderr").read_text().strip().replace("\n", ", ")
             clock = f" lifecycle_s={lifecycle:.4f}" if container else ""
-            print(f"{name} {elapsed:.4f}s exact cold=0/{pages} pages{clock} | {stages}", flush=True)
-        return elapsed, lifecycle
+            print(f"{name} {elapsed:.4f}s exact cold=0/{pages} pages{clock} cpu_s={used_cpu:.5f} | {stages}", flush=True)
+        return elapsed, lifecycle, used_cpu
 
 
 def dataset(name, limit, allow_cutoff=False):
     return run(name, data/name, data/(name+"-answer"), limit, allow_cutoff)
 
 
-def predict(elapsed):
-    if calibration.exists():
-        points = json.loads(calibration.read_text())
-    else:
-        points = [[2.9604, 2.06], [2.6091, 1.60]] if image else [[5.3767, 2.06], [4.9941, 1.60]]
-    (old, old_board), (recent, recent_board) = points
-    if old <= recent or old_board <= recent_board:
-        sys.exit("cold reference medians do not establish a positive slope")
-    slope = (old_board-recent_board)/(old-recent)
-    intercept = recent_board-slope*recent
-    return f"intercept_s={intercept:.6f} slope={slope:.6f} predicted_board_s={intercept+slope*elapsed:.4f}"
+def predict(times):
+    # Rows: median container lifecycle (or native process time), CPU seconds, board seconds.
+    points = json.loads(calibration.read_text()) if calibration.exists() else (
+        [[2.5874, 8.59367, 2.06], [2.3138, 6.65119, 1.6], [1.3575, 6.44747, 1.5]] if image else [[4.8245, 12.37469, 2.06], [4.4715, 9.55942, 1.6], [4.0621, 7.6297, 1.5]])
+    mae, _, name, _, parameters = select_model(points)[0]
+    wall = statistics.median(t[1] for t in times)
+    cpu = statistics.median(t[2] for t in times)
+    predicted = estimate(parameters, (wall, cpu))
+    ratio = statistics.median(row[2]/row[0] for row in points)
+    return (f"model={name!r} loo_mae_s={mae:.4f} cpu_s={cpu:.4f} "
+            f"ratio_estimate_s={ratio*wall:.4f} predicted_board_s={predicted:.4f}")
 
 
 if calibrate or quick:
     reps = 5 if calibrate else 3
-    measured = statistics.median(dataset("practice", 300)[0] for _ in range(reps))
+    times = [dataset("practice", 300) for _ in range(reps)]
+    measured = statistics.median(t[0] for t in times)
     print(f"cold_20M_median{reps}_s={measured:.4f}", flush=True)
     if quick:
-        print(predict(measured), flush=True)
+        print(predict(times), flush=True)
     sys.exit(0)
 
 
@@ -235,7 +262,7 @@ if first[1] < 20:
     deadline = 300-first[1]
     for _ in range(2):
         t = dataset("practice", max(.001, deadline), True)
-        times.append((300, 300) if t is None else t)
+        times.append((300, 300, 0) if t is None else t)
         deadline = max(0, deadline-(deadline if t is None else t[1]))
 official = statistics.median(t[1] for t in times)
 while len(times) < 5:
@@ -243,6 +270,6 @@ while len(times) < 5:
 median = statistics.median(t[0] for t in times)
 final_times = [dataset("final", 180) for _ in range(1 if tuning else (5 if rerank else 3))]
 print(f"practice_rule_s={official:.4f} local_20M_median5_s={median:.4f} "
-      f"{predict(median)} "
+      f"{predict(times)} "
       f"final_60M_s={statistics.median(t[0] for t in final_times):.4f} "
       f"final_rule_s={statistics.median(t[1] for t in final_times):.4f}", flush=True)

@@ -23,7 +23,7 @@ fn columns<T>(n: usize) -> Vec<Vec<T>> {
     (0..n).map(|_| Vec::new()).collect()
 }
 
-fn transpose<T>(lanes: Vec<Vec<Vec<T>>>, n: usize) -> Vec<Vec<Vec<T>>> {
+fn transpose<T>(lanes: Vec<Vec<T>>, n: usize) -> Vec<Vec<T>> {
     let mut partitions = columns(n);
     for lane in lanes {
         for (out, part) in partitions.iter_mut().zip(lane) {

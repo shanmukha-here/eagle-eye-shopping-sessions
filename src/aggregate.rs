@@ -348,13 +348,13 @@ impl Totals {
         &mut self,
         keys: &Keys,
         people: &crate::compact::DensePeople,
-        mut events: Vec<Vec<crate::compact::Event>>,
-        mut clicks: Vec<Vec<Click>>,
+        mut events: Vec<crate::compact::Output<crate::compact::Event, 16>>,
+        mut clicks: Vec<crate::compact::Output<crate::compact::Click, 8>>,
         shards: usize,
         max_people: usize,
         scratch: &mut DenseScratch,
     ) {
-        let n = events.iter().map(Vec::len).sum();
+        let n = events.iter().map(|v| v.len()).sum();
         if n == 0 {
             return;
         }
@@ -367,21 +367,25 @@ impl Totals {
         };
         let mut groups = Vec::<(u32, usize, usize)>::new();
         let shift = shards.trailing_zeros();
-        for event in events.iter_mut().flatten() {
-            let slot = &mut index[(event.person >> shift) as usize];
-            if *slot == 0 {
-                groups.push((event.person, 0, 0));
-                *slot = groups.len() as u32;
-            }
-            event.person = *slot - 1;
-            groups[event.person as usize].1 += 1;
+        for rows in &mut events {
+            rows.walk(|event| {
+                let slot = &mut index[(event.person >> shift) as usize];
+                if *slot == 0 {
+                    groups.push((event.person, 0, 0));
+                    *slot = groups.len() as u32;
+                }
+                event.person = *slot - 1;
+                groups[event.person as usize].1 += 1;
+            });
         }
-        for click in clicks.iter_mut().flatten() {
-            let slot = index[(click.u >> shift) as usize];
-            if slot != 0 {
-                groups[slot as usize - 1].2 += 1;
-            }
-            click.u = u64::from(slot);
+        for rows in &mut clicks {
+            rows.walk(|click| {
+                let slot = index[(click.person >> shift) as usize];
+                if slot != 0 {
+                    groups[slot as usize - 1].2 += 1;
+                }
+                click.person = slot;
+            });
         }
         let (mut eoff, mut coff) = (0, 0);
         for (_, e, c) in &mut groups {
@@ -403,48 +407,43 @@ impl Totals {
         };
         es.clear();
         cs.clear();
-        if scratch.reuse {
-            es.reserve(n);
-            cs.reserve(coff);
-            let write_events = &mut es.spare_capacity_mut()[..n];
-            let write_clicks = &mut cs.spare_capacity_mut()[..coff];
-            for event in events.into_iter().flatten() {
-                let at = &mut groups[event.person as usize].1;
-                write_events[*at].write(u64::from(event.ts) << 32 | u64::from(event.purchase));
-                *at += 1;
-            }
-            for click in clicks.into_iter().flatten().filter(|c| c.u != 0) {
-                let at = &mut groups[click.u as usize - 1].2;
-                write_clicks[*at].write(Touch {
-                    t: click.t,
-                    id: click.id,
-                    campaign: click.campaign,
-                });
-                *at += 1;
-            }
-            // The exact prefix counts cover n and coff slots, respectively.
-            // Each input consumed below was counted once in the matching group.
-            unsafe {
-                es.set_len(n);
-                cs.set_len(coff);
-            }
-        } else {
+        es.reserve(n);
+        cs.reserve(coff);
+        if !scratch.reuse {
             es.resize(n, 0);
             cs.resize(coff, Touch::default());
-            for event in events.into_iter().flatten() {
+        }
+        let event_base = es.as_mut_ptr();
+        let click_base = cs.as_mut_ptr();
+        for rows in &mut events {
+            rows.walk(|event| {
                 let at = &mut groups[event.person as usize].1;
-                es[*at] = u64::from(event.ts) << 32 | u64::from(event.purchase);
+                let value = u64::from(event.ts) << 32 | u64::from(event.purchase);
+                // Group offsets are disjoint prefixes with exactly n events.
+                unsafe { event_base.add(*at).write(value) };
                 *at += 1;
-            }
-            for click in clicks.into_iter().flatten().filter(|c| c.u != 0) {
-                let at = &mut groups[click.u as usize - 1].2;
-                cs[*at] = Touch {
-                    t: click.t,
-                    id: click.id,
-                    campaign: click.campaign,
-                };
-                *at += 1;
-            }
+            });
+        }
+        for rows in &mut clicks {
+            rows.walk(|click| {
+                if click.person != 0 {
+                    let at = &mut groups[click.person as usize - 1].2;
+                    // Click prefixes count only events with a non-empty group.
+                    unsafe {
+                        click_base.add(*at).write(Touch {
+                            t: click.t,
+                            id: click.id,
+                            campaign: click.campaign,
+                        })
+                    };
+                    *at += 1;
+                }
+            });
+        }
+        // Each prefix slot was initialized exactly once by the scatter above.
+        unsafe {
+            es.set_len(n);
+            cs.set_len(coff);
         }
         let (mut e, mut c) = (0, 0);
         for (person, end_e, end_c) in groups {

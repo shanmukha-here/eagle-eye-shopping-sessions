@@ -2,7 +2,7 @@
 //! person, time and packed purchase fields remain.
 use crate::{
     ARRIVAL_BIAS, Candidate, Catalog, Detail, EventSink, Keys, SIDE, Totals, events, finish,
-    input::{self, Dates, Input, jobs},
+    input::{self, Dates, Input},
     keys::{self, Aliases, IntMap, Key},
     output, raw, read_people, transpose,
 };
@@ -28,19 +28,29 @@ struct Slot {
 }
 
 pub(crate) struct DensePeople {
-    slots: memmap2::MmapMut,
+    _arena: memmap2::MmapMut,
+    base: std::ptr::NonNull<Slot>,
+    len: usize,
     overflow: Mutex<Overflow>,
 }
+// The owned arena outlives base. Root fields are written only in the serial
+// constructor. Shared inserts mutate AtomicU64 keys or lock the spill.
+unsafe impl Send for DensePeople {}
+unsafe impl Sync for DensePeople {}
+
 impl DensePeople {
     fn new(original: &Aliases, bytes: usize, divisor: usize) -> Self {
         let entries = original.entries().count();
         let n = (bytes / divisor + entries * 4 + 16)
             .next_power_of_two()
             .min(1 << 25);
-        let slots = memmap2::MmapMut::map_anon(n * std::mem::size_of::<Slot>()).unwrap();
+        let mut slots = memmap2::MmapMut::map_anon(n * std::mem::size_of::<Slot>()).unwrap();
         let _ = slots.advise(memmap2::Advice::HugePage);
-        let mut people = Self {
-            slots,
+        let base = std::ptr::NonNull::new(slots.as_mut_ptr().cast()).unwrap();
+        let people = Self {
+            _arena: slots,
+            base,
+            len: n,
             overflow: Mutex::default(),
         };
         for (_, root) in original.entries() {
@@ -52,7 +62,7 @@ impl DensePeople {
             if id < people.table().len() {
                 // Construction has exclusive access. All later root reads
                 // happen after workers receive this finished table.
-                unsafe { (&mut *people.slots.as_mut_ptr().cast::<Slot>().add(id)).root = root + 1 };
+                unsafe { (*people.base.as_ptr().add(id)).root = root + 1 };
             }
         }
         people
@@ -62,12 +72,7 @@ impl DensePeople {
     fn table(&self) -> &[Slot] {
         // The arena is page-aligned and zero is valid for every Slot field.
         // Concurrent key insertions use the AtomicU64 field.
-        unsafe {
-            std::slice::from_raw_parts(
-                self.slots.as_ptr().cast(),
-                self.slots.len() / std::mem::size_of::<Slot>(),
-            )
-        }
+        unsafe { std::slice::from_raw_parts(self.base.as_ptr(), self.len) }
     }
 
     #[inline]
@@ -126,11 +131,134 @@ impl DensePeople {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
 pub(crate) struct Event {
     pub person: u32,
     pub ts: u32,
     pub purchase: u32,
+}
+
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
+pub(crate) struct Click {
+    pub t: i64,
+    pub id: Key,
+    pub person: u32,
+    pub campaign: u32,
+}
+
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct Line<T, const N: usize> {
+    rows: [T; N],
+}
+
+struct Lines<T, const N: usize> {
+    blocks: Vec<Line<T, N>>,
+    pending: Line<T, N>,
+    count: usize,
+    stream: bool,
+}
+
+pub(crate) struct Output<T, const N: usize> {
+    linear: Vec<T>,
+    lines: Option<Box<Lines<T, N>>>,
+}
+
+trait DenseRow: Copy + Default {}
+impl DenseRow for Event {}
+impl DenseRow for Click {}
+
+impl<T: DenseRow, const N: usize> Output<T, N> {
+    fn new(combine: usize, fast: bool) -> Self {
+        Self {
+            linear: Vec::new(),
+            lines: (combine != 0).then(|| {
+                Box::new(Lines {
+                    blocks: Vec::new(),
+                    pending: Line {
+                        rows: [T::default(); N],
+                    },
+                    count: 0,
+                    stream: combine == 2 && fast,
+                })
+            }),
+        }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, row: T) {
+        let Some(lines) = &mut self.lines else {
+            self.linear.push(row);
+            return;
+        };
+        lines.pending.rows[lines.count] = row;
+        lines.count += 1;
+        if lines.count == N {
+            if lines.stream {
+                if lines.blocks.len() == lines.blocks.capacity() {
+                    unsafe { std::arch::x86_64::_mm_sfence() };
+                    lines.blocks.reserve(1);
+                }
+                let n = lines.blocks.len();
+                // DenseRow is private and implemented only by the two
+                // padding-free records above. Used instantiations fill whole
+                // cache lines and the allocator aligns them to 64 bytes.
+                let size = std::mem::size_of::<Line<T, N>>();
+                assert_eq!(size, N * std::mem::size_of::<T>());
+                unsafe {
+                    stream_bytes(
+                        lines.blocks.as_mut_ptr().add(n).cast(),
+                        (&lines.pending as *const Line<T, N>).cast(),
+                        size / 32,
+                    );
+                    lines.blocks.set_len(n + 1);
+                }
+            } else {
+                lines.blocks.push(lines.pending);
+            }
+            lines.count = 0;
+        }
+    }
+}
+
+impl<T, const N: usize> Output<T, N> {
+    pub(crate) fn len(&self) -> usize {
+        self.linear.len()
+            + self
+                .lines
+                .as_ref()
+                .map_or(0, |lines| lines.blocks.len() * N + lines.count)
+    }
+    pub(crate) fn walk(&mut self, mut f: impl FnMut(&mut T)) {
+        if let Some(lines) = &mut self.lines {
+            for frame in &mut lines.blocks {
+                for row in &mut frame.rows {
+                    f(row);
+                }
+            }
+            for row in &mut lines.pending.rows[..lines.count] {
+                f(row);
+            }
+        } else {
+            for row in &mut self.linear {
+                f(row);
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn stream_bytes(
+    out: *mut std::arch::x86_64::__m256i,
+    from: *const std::arch::x86_64::__m256i,
+    words: usize,
+) {
+    use std::arch::x86_64::*;
+    for i in 0..words {
+        unsafe { _mm256_stream_si256(out.add(i), _mm256_load_si256(from.add(i))) };
+    }
 }
 
 #[derive(Clone, Copy, Default)]
@@ -358,7 +486,7 @@ fn arrival(row: Payload, part: &Part) -> i64 {
 }
 
 #[inline]
-fn send(row: Payload, part: &Part, out: &mut [Vec<Event>]) {
+fn send(row: Payload, part: &Part, out: &mut [Output<Event, 16>]) {
     if row.ts == u32::MAX {
         return;
     }
@@ -378,7 +506,7 @@ fn send(row: Payload, part: &Part, out: &mut [Vec<Event>]) {
 
 fn reduce(
     parts: Vec<Part>,
-    out: &mut [Vec<Event>],
+    out: &mut [Output<Event, 16>],
     scratch: &mut Vec<u64>,
     origin: i64,
     bits_per_row: usize,
@@ -460,6 +588,7 @@ pub(crate) fn pipeline(
         .next_power_of_two();
     let divisor = setting("SHOPPING_DENSE_DIVISOR", 768).clamp(16, 4096);
     let combine = setting("SHOPPING_SW_COMBINE", 0).min(2);
+    let combine_out = setting("SHOPPING_PERSON_COMBINE", 0).min(2);
     let reuse = setting("SHOPPING_REUSE_SCRATCH", 0) != 0;
     let bits = setting("SHOPPING_DEDUP_BITS", 16).clamp(2, 64);
     let cache = setting("SHOPPING_NAME_CACHE", 0).min(4096);
@@ -509,7 +638,9 @@ pub(crate) fn pipeline(
                     },
                     Dates::new(),
                     input::ReadBuffer::new(),
-                    super::columns(shards),
+                    (0..shards)
+                        .map(|_| Output::<Click, 8>::new(combine_out, fast))
+                        .collect::<Vec<_>>(),
                     Vec::new(),
                 )
             },
@@ -534,16 +665,23 @@ pub(crate) fn pipeline(
                         temporary,
                         fast,
                     );
-                    for mut click in temporary.drain(..) {
+                    for click in temporary.drain(..) {
                         let person = emit.names.get(click.u, &people, &aliases);
-                        click.u = u64::from(person);
-                        clicks[person as usize & (shards - 1)].push(click);
+                        clicks[person as usize & (shards - 1)].push(Click {
+                            t: click.t,
+                            id: click.id,
+                            campaign: click.campaign,
+                            person,
+                        });
                     }
                 }
             },
             |_, lane| {
                 if let Some(frame) = lane.0.bins.first().and_then(|part| part.frames.as_ref()) {
                     frame.fence();
+                }
+                if combine_out == 2 && fast {
+                    unsafe { std::arch::x86_64::_mm_sfence() };
                 }
                 lane
             },
@@ -561,12 +699,25 @@ pub(crate) fn pipeline(
         click_input.release();
     });
     stage("compact_scan");
-    let reducers = jobs(
+    let reducers = input::jobs_finish(
         parts,
         threads,
-        |_| (super::columns(shards), Vec::new()),
+        |_| {
+            (
+                (0..shards)
+                    .map(|_| Output::<Event, 16>::new(combine_out, fast))
+                    .collect::<Vec<_>>(),
+                Vec::new(),
+            )
+        },
         |(winners, scratch), part| {
             reduce(part, winners, scratch, start, bits, reuse);
+        },
+        |_, lane| {
+            if combine_out == 2 && fast {
+                unsafe { std::arch::x86_64::_mm_sfence() };
+            }
+            lane
         },
     );
     release.join().unwrap();

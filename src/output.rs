@@ -46,44 +46,43 @@ pub fn users(path: &Path, rows: &[UserRow], keys: &Keys, categories: &[ByteArray
     let mut f = file(path, USER);
     for batch in rows.chunks(32768) {
         let mut group = f.next_row_group().unwrap();
-        let mut prev = None;
-        let mut value = ByteArray::default();
-        let names: Vec<_> = batch
-            .iter()
-            .map(|r| {
-                if prev != Some(r.u) {
-                    prev = Some(r.u);
-                    value = ByteArray::from(keys.bytes(r.u));
-                }
-                value.clone()
-            })
+        let mut packed = Vec::with_capacity(9 * batch.len());
+        let mut spans = Vec::with_capacity(batch.len());
+        let mut days = Vec::with_capacity(batch.len());
+        let mut sessions = Vec::with_capacity(batch.len());
+        let mut events = Vec::with_capacity(batch.len());
+        let mut revenue = Vec::with_capacity(batch.len());
+        let mut levels = Vec::with_capacity(batch.len());
+        let mut cats = Vec::with_capacity(batch.len());
+        let mut previous = None;
+        let mut span = (0, 0);
+        for row in batch {
+            if previous != Some(row.u) {
+                let start = packed.len();
+                keys.append_bytes(row.u, &mut packed);
+                span = (start, packed.len() - start);
+                previous = Some(row.u);
+            }
+            spans.push(span);
+            days.push(row.day);
+            sessions.push(row.sessions);
+            events.push(row.events);
+            revenue.push(row.revenue);
+            levels.push(i16::from(row.top.is_some()));
+            if let Some(c) = row.top {
+                cats.push(categories[c as usize].clone());
+            }
+        }
+        let bytes = ByteArray::from(packed);
+        let names: Vec<_> = spans
+            .into_iter()
+            .map(|(off, n)| bytes.slice(off, n))
             .collect();
         column::<ByteArrayType>(&mut group, &names, None);
-        column::<Int32Type>(
-            &mut group,
-            &batch.iter().map(|r| r.day).collect::<Vec<_>>(),
-            None,
-        );
-        column::<Int64Type>(
-            &mut group,
-            &batch.iter().map(|r| r.sessions).collect::<Vec<_>>(),
-            None,
-        );
-        column::<Int64Type>(
-            &mut group,
-            &batch.iter().map(|r| r.events).collect::<Vec<_>>(),
-            None,
-        );
-        column::<Int64Type>(
-            &mut group,
-            &batch.iter().map(|r| r.revenue).collect::<Vec<_>>(),
-            None,
-        );
-        let levels: Vec<_> = batch.iter().map(|r| i16::from(r.top.is_some())).collect();
-        let cats: Vec<_> = batch
-            .iter()
-            .filter_map(|r| r.top.map(|c| categories[c as usize].clone()))
-            .collect();
+        column::<Int32Type>(&mut group, &days, None);
+        column::<Int64Type>(&mut group, &sessions, None);
+        column::<Int64Type>(&mut group, &events, None);
+        column::<Int64Type>(&mut group, &revenue, None);
         column::<ByteArrayType>(&mut group, &cats, Some(&levels));
         group.close().unwrap();
     }

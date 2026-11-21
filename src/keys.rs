@@ -88,20 +88,25 @@ impl Keys {
         id
     }
     pub fn bytes(&self, k: Key) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(9);
+        self.append_bytes(k, &mut bytes);
+        bytes
+    }
+    pub fn append_bytes(&self, k: Key, out: &mut Vec<u8>) {
         if k & EXTERNAL != 0 {
-            return self.0.lock().unwrap().strings[(k ^ EXTERNAL) as usize].clone();
+            out.extend_from_slice(&self.0.lock().unwrap().strings[(k ^ EXTERNAL) as usize]);
+            return;
         }
-        let mut out = Vec::with_capacity(9);
-        out.extend_from_slice(&(k & LOW).to_be_bytes());
+        let packed = k & LOW;
+        let len = 8 - packed.trailing_zeros() as usize / 8;
+        out.extend_from_slice(&packed.to_be_bytes()[..len]);
         let mut last = 0;
         for i in 0..7 {
             last |= (((k >> (7 + 8 * i)) & 1) as u8) << i;
         }
-        out.push(last);
-        while out.last() == Some(&0) {
-            out.pop();
+        if last != 0 {
+            out.push(last);
         }
-        out
     }
     #[inline]
     pub fn cmp(&self, a: Key, b: Key) -> Ordering {
@@ -215,5 +220,27 @@ impl Aliases {
             }
             i = (i + 1) & mask;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Keys;
+    #[test]
+    fn output_names_round_trip() {
+        let keys = Keys::default();
+        for n in 0..16 {
+            for value in 0..=127 {
+                let mut name = vec![b'a'; n];
+                if let Some(tail) = name.last_mut() {
+                    *tail = value;
+                }
+                let key = keys.key(&name);
+                let mut buf = vec![b'/'];
+                keys.append_bytes(key, &mut buf);
+                assert_eq!(&buf[1..], name);
+            }
+        }
+        assert_eq!(keys.bytes(keys.key("café".as_bytes())), "café".as_bytes());
     }
 }

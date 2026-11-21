@@ -40,7 +40,7 @@ pub fn jobs<T: Send, R: Send>(
 pub struct Input(Vec<Mmap>);
 impl Input {
     pub fn open(path: &Path) -> Self {
-        let paths = if path.is_dir() {
+        let mut paths = if path.is_dir() {
             fs::read_dir(path)
                 .unwrap()
                 .map(|p| p.unwrap().path())
@@ -49,13 +49,18 @@ impl Input {
         } else {
             vec![path.to_owned()]
         };
+        paths.sort_unstable();
         Self(
             paths
                 .into_iter()
                 .filter_map(|p| {
                     let f = File::open(p).unwrap();
                     // The scorer mounts immutable input files.
-                    (f.metadata().unwrap().len() != 0).then(|| unsafe { Mmap::map(&f).unwrap() })
+                    (f.metadata().unwrap().len() != 0).then(|| {
+                        let map = unsafe { Mmap::map(&f).unwrap() };
+                        let _ = map.advise(memmap2::Advice::Sequential);
+                        map
+                    })
                 })
                 .collect(),
         )
@@ -63,24 +68,55 @@ impl Input {
     pub fn bytes(&self) -> usize {
         self.0.iter().map(|m| m.len()).sum()
     }
-    pub fn chunks(&self) -> Vec<&[u8]> {
-        let mut out = Vec::new();
-        for m in &self.0 {
-            let Some(header) = m.iter().position(|&b| b == b'\n') else {
-                continue;
-            };
-            let mut start = header + 1;
-            while start < m.len() {
-                let cut = (start + (1 << 20)).min(m.len());
-                let end = m[cut..]
-                    .iter()
-                    .position(|&b| b == b'\n')
-                    .map_or(m.len(), |n| cut + n + 1);
-                out.push(&m[start..end]);
-                start = end;
+    pub fn prefetch(&self) {
+        for file in &self.0 {
+            // Linux caps a single speculative read. Queue the file in order.
+            const WINDOW: usize = 2 << 20;
+            for off in (0..file.len()).step_by(WINDOW) {
+                let _ = file.advise_range(
+                    memmap2::Advice::WillNeed,
+                    off,
+                    (file.len() - off).min(WINDOW),
+                );
             }
         }
-        out
+    }
+    pub fn chunks(&self) -> Vec<Chunk<'_>> {
+        const STEP: usize = 1 << 20;
+        self.0
+            .iter()
+            .flat_map(|file| {
+                (0..file.len()).step_by(STEP).map(|start| Chunk {
+                    file,
+                    start,
+                    end: (start + STEP).min(file.len()),
+                })
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Chunk<'a> {
+    file: &'a [u8],
+    start: usize,
+    end: usize,
+}
+impl<'a> Chunk<'a> {
+    // A row belongs to the chunk containing its preceding LF. This skips
+    // exactly one header per file, even when a single row spans many chunks.
+    pub fn records(self) -> &'a [u8] {
+        let Some(first) = self.file[self.start..self.end]
+            .iter()
+            .position(|&b| b == 10)
+        else {
+            return &[];
+        };
+        let stop = self.file[self.end..]
+            .iter()
+            .position(|&b| b == 10)
+            .map_or(self.file.len(), |n| self.end + n + 1);
+        &self.file[self.start + first + 1..stop]
     }
 }
 
@@ -450,6 +486,37 @@ mod tests {
             scalar.push(f.iter().map(|v| v.to_vec()).collect::<Vec<_>>())
         });
         assert_eq!(scalar, expected);
+    }
+    #[test]
+    fn lazy_ranges_preserve_physical_rows() {
+        for file in [
+            &b"header\nabc\nx\nlast"[..],
+            b"h\n\n\n",
+            b"header only",
+            b"",
+            b"a long header spans chunks\nthen a really long row\nshort\n",
+            b"\n\n",
+        ] {
+            let expected = file
+                .iter()
+                .position(|&b| b == 10)
+                .map_or(&file[0..0], |n| &file[n + 1..]);
+            for step in 1..=file.len() + 1 {
+                let got: Vec<_> = (0..file.len())
+                    .step_by(step)
+                    .flat_map(|start| {
+                        Chunk {
+                            file,
+                            start,
+                            end: (start + step).min(file.len()),
+                        }
+                        .records()
+                    })
+                    .copied()
+                    .collect();
+                assert_eq!(got, expected, "step {step}");
+            }
+        }
     }
     #[test]
     fn quotes_and_delimiters_at_vector_boundaries() {

@@ -40,7 +40,7 @@ impl Catalog {
         let mut names = vec![b"unknown".to_vec()];
         let mut pairs = Vec::new();
         for chunk in Input::open(&data.join("products.csv")).chunks() {
-            rows::<2>(chunk, |v| {
+            rows::<2>(chunk.records(), |v| {
                 names.push(v[1].to_vec());
                 pairs.push((keys.key(v[0]), v[1].to_vec()));
             });
@@ -57,7 +57,7 @@ impl Catalog {
         let mut campaigns = IntMap::default();
         let mut channels = vec![(ByteArray::from("organic"), ByteArray::from("organic"))];
         for chunk in Input::open(&data.join("campaigns.csv")).chunks() {
-            rows::<2>(chunk, |v| {
+            rows::<2>(chunk.records(), |v| {
                 campaigns.insert(keys.key(v[0]), channels.len() as u32);
                 channels.push((ByteArray::from(v[0]), ByteArray::from(v[1])));
             });
@@ -228,39 +228,54 @@ fn main() {
     let people = std::sync::OnceLock::new();
     let mut tasks = vec![None];
     tasks.extend(raw.chunks().into_iter().map(Some));
-    let lanes = jobs(
-        tasks,
-        threads,
-        |_| {
-            let expected = raw.bytes() / 64 / threads / n;
-            (
-                Dates::new(),
-                (0..n)
-                    .map(|_| Vec::with_capacity(expected))
-                    .collect::<Vec<_>>(),
-            )
-        },
-        |s, task| {
-            if let Some(chunk) = task {
-                events(chunk, &mut s.0, &keys, &catalog, start, end, &mut s.1);
-            } else {
-                people.get_or_init(|| {
-                    let links = Input::open(&data.join("links"));
-                    let mut people = People::default();
-                    people.reserve(links.bytes() / 22);
-                    for chunk in links.chunks() {
-                        rows::<2>(chunk, |f| {
-                            if !f[0].is_empty() && !f[1].is_empty() {
-                                people.join(&keys, keys.key(f[0]), keys.key(f[1]));
-                            }
-                        });
-                    }
-                    drop(links);
-                    people.freeze()
-                });
-            }
-        },
-    );
+    let click_input = Input::open(&data.join("clicks"));
+    let lanes = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            raw.prefetch();
+            click_input.prefetch();
+        });
+        jobs(
+            tasks,
+            threads,
+            |_| {
+                let expected = raw.bytes() / 64 / threads / n;
+                (
+                    Dates::new(),
+                    (0..n)
+                        .map(|_| Vec::with_capacity(expected))
+                        .collect::<Vec<_>>(),
+                )
+            },
+            |s, task| {
+                if let Some(chunk) = task {
+                    events(
+                        chunk.records(),
+                        &mut s.0,
+                        &keys,
+                        &catalog,
+                        start,
+                        end,
+                        &mut s.1,
+                    );
+                } else {
+                    people.get_or_init(|| {
+                        let links = Input::open(&data.join("links"));
+                        let mut people = People::default();
+                        people.reserve(links.bytes() / 22);
+                        for chunk in links.chunks() {
+                            rows::<2>(chunk.records(), |f| {
+                                if !f[0].is_empty() && !f[1].is_empty() {
+                                    people.join(&keys, keys.key(f[0]), keys.key(f[1]));
+                                }
+                            });
+                        }
+                        drop(links);
+                        people.freeze()
+                    });
+                }
+            },
+        )
+    });
     let people = people.into_inner().unwrap();
     let parts = transpose(lanes.into_iter().map(|s| s.1).collect(), n);
     drop(raw);
@@ -277,13 +292,13 @@ fn main() {
     let event_parts = transpose(grouped, person_shards);
     stage("event dedup and linking");
 
-    let raw = Input::open(&data.join("clicks"));
+    let raw = click_input;
     let lanes = jobs(
         raw.chunks(),
         threads,
         |_| (Dates::new(), columns(person_shards)),
         |s, chunk| {
-            rows::<4>(chunk, |f| {
+            rows::<4>(chunk.records(), |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
@@ -358,4 +373,9 @@ fn main() {
         &catalog.channels,
     );
     stage("parquet");
+    // Both Parquet footers have been closed and all output workers joined.
+    unsafe extern "C" {
+        fn _exit(status: std::ffi::c_int) -> !;
+    }
+    unsafe { _exit(0) }
 }

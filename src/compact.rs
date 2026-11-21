@@ -256,12 +256,50 @@ impl Part {
     }
 }
 
+struct LocalNames {
+    cache: Vec<(Key, u32)>,
+}
+
+impl LocalNames {
+    fn new(size: usize) -> Self {
+        Self {
+            cache: vec![(0, 0); size],
+        }
+    }
+
+    #[inline(always)]
+    fn get(&mut self, key: Key, people: &DensePeople, aliases: &Aliases) -> u32 {
+        if self.cache.is_empty() {
+            return people.person(key, aliases);
+        }
+        let mask = self.cache.len() - 1;
+        let entry = &mut self.cache[(key >> 16) as usize & mask];
+        if entry.0 != key {
+            *entry = (key, people.person(key, aliases));
+        }
+        entry.1
+    }
+}
+
 struct Emitter<'a> {
     bins: Vec<Part>,
     people: &'a DensePeople,
     aliases: &'a Aliases,
+    names: LocalNames,
+    prefetch: bool,
 }
 impl EventSink<u32> for Emitter<'_> {
+    #[inline(always)]
+    fn prefetch_user(&self, key: Key) {
+        if self.prefetch {
+            let slot = key as usize & (self.people.table.len() - 1);
+            unsafe {
+                let base = self.people.table.as_ptr().add(slot);
+                std::arch::x86_64::_mm_prefetch(base.cast(), std::arch::x86_64::_MM_HINT_T0);
+            }
+        }
+    }
+
     #[inline(always)]
     fn push(&mut self, row: Candidate<u32>, detail: Option<Detail>) {
         let bin = row.id as usize & (self.bins.len() - 1);
@@ -276,7 +314,7 @@ impl EventSink<u32> for Emitter<'_> {
         let person = if row.t == u32::MAX {
             0
         } else {
-            self.people.person(row.user, self.aliases)
+            self.names.get(row.user, self.people, self.aliases)
         };
         part.push(
             row.id,
@@ -388,6 +426,13 @@ pub(crate) fn pipeline(
     let divisor = setting("SHOPPING_DENSE_DIVISOR", 768).clamp(16, 4096);
     let combine = setting("SHOPPING_SW_COMBINE", 0).min(2);
     let bits = setting("SHOPPING_DEDUP_BITS", 16).clamp(2, 64);
+    let cache = setting("SHOPPING_NAME_CACHE", 0).min(4096);
+    let cache = if cache == 0 {
+        0
+    } else {
+        cache.next_power_of_two()
+    };
+    let prefetch = setting("SHOPPING_PREFETCH_DENSE", 0) != 0;
     let clock = raw::Calendar::new(start, end);
     let fast = raw::available();
     let aliases = read_people(data, &keys, threads, fast);
@@ -423,6 +468,8 @@ pub(crate) fn pipeline(
                             .collect(),
                         people: &people,
                         aliases: &aliases,
+                        names: LocalNames::new(cache),
+                        prefetch,
                     },
                     Dates::new(),
                     input::ReadBuffer::new(),
@@ -452,7 +499,7 @@ pub(crate) fn pipeline(
                         fast,
                     );
                     for mut click in temporary.drain(..) {
-                        let person = people.person(click.u, &aliases);
+                        let person = emit.names.get(click.u, &people, &aliases);
                         click.u = u64::from(person);
                         clicks[person as usize & (shards - 1)].push(click);
                     }

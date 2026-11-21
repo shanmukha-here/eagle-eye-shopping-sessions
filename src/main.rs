@@ -180,6 +180,9 @@ struct Candidate<T> {
 }
 
 trait EventSink<T: EventTime> {
+    #[inline(always)]
+    fn prefetch_user(&self, _key: Key) {}
+
     fn push(&mut self, row: Candidate<T>, detail: Option<Detail>);
 }
 

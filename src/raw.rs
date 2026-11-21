@@ -398,6 +398,7 @@ unsafe fn event<const LEVEL: usize, T: EventTime>(
             std::hint::black_box((id, user, ts, received));
             return true;
         }
+        emit.prefetch_user(user);
         let time = match width {
             13 => stamp::<13>(ts, state.clock),
             20 => stamp::<20>(ts, state.clock),

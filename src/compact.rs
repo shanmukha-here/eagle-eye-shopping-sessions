@@ -9,7 +9,7 @@ use crate::{
 use std::{
     path::Path,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering::Relaxed},
     },
 };
@@ -166,9 +166,10 @@ pub(crate) struct Output<T, const N: usize> {
     lines: Option<Box<Lines<T, N>>>,
 }
 
-trait DenseRow: Copy + Default {}
-impl DenseRow for Event {}
-impl DenseRow for Click {}
+// SAFETY: implement only for initialized, padding-free plain records.
+pub(crate) unsafe trait DenseRow: Copy + Default {}
+unsafe impl DenseRow for Event {}
+unsafe impl DenseRow for Click {}
 
 impl<T: DenseRow, const N: usize> Output<T, N> {
     fn new(combine: usize, fast: bool) -> Self {
@@ -329,15 +330,92 @@ unsafe fn stream_frame(out: *mut Frame, from: &Frame) {
     }
 }
 
+pub(crate) struct ParseArena {
+    _map: memmap2::MmapMut,
+    base: std::ptr::NonNull<u8>,
+    bytes: usize,
+}
+
+// Each partition receives a unique, disjoint lane once. It can be read
+// after its writer joins. The sorter requires exclusive arena ownership.
+unsafe impl Send for ParseArena {}
+unsafe impl Sync for ParseArena {}
+impl ParseArena {
+    fn new(partitions: usize, capacity: usize) -> Arc<Self> {
+        let bytes = partitions * capacity * 20;
+        let mut map = memmap2::MmapMut::map_anon(bytes).unwrap();
+        let _ = map.advise(memmap2::Advice::HugePage);
+        let base = std::ptr::NonNull::new(map.as_mut_ptr()).unwrap();
+        Arc::new(Self {
+            _map: map,
+            base,
+            bytes,
+        })
+    }
+
+    pub(crate) fn words(&mut self, n: usize) -> Option<&mut [u64]> {
+        if n > self.bytes / 8 {
+            return None;
+        }
+        // mmap is page-aligned and initialized even in untouched slots.
+        // No partition can still reference this arena after unwrapping Arc.
+        Some(unsafe { std::slice::from_raw_parts_mut(self.base.as_ptr().cast(), n) })
+    }
+}
+
+struct ArenaPart {
+    arena: Arc<ParseArena>,
+    offset: usize,
+    limit: usize,
+    used: usize,
+}
+impl ArenaPart {
+    fn addresses(&self) -> (*mut Key, *mut Payload) {
+        // The allocator gives this partition limit*20 disjoint bytes.
+        unsafe {
+            let base = self.arena.base.as_ptr().add(self.offset);
+            (base.cast(), base.add(self.limit * 8).cast())
+        }
+    }
+    fn push(&mut self, key: Key, row: Payload) -> bool {
+        if self.used == self.limit {
+            return false;
+        }
+        let (ids, rows) = self.addresses();
+        // Only this partition accessor can write these slots.
+        unsafe {
+            ids.add(self.used).write(key);
+            rows.add(self.used).write(row);
+        }
+        self.used += 1;
+        true
+    }
+    fn split(&self) -> (&[Key], &[Payload]) {
+        let (ids, rows) = self.addresses();
+        // Both streams expose only the initialized prefix.
+        unsafe {
+            (
+                std::slice::from_raw_parts(ids, self.used),
+                std::slice::from_raw_parts(rows, self.used),
+            )
+        }
+    }
+}
+
 struct Part {
     ids: Vec<Key>,
     rows: Vec<Payload>,
     extra: Vec<Detail>,
     frames: Option<Box<Frames>>,
+    arena: Option<ArenaPart>,
 }
 impl Part {
-    fn new(cap: usize, combine: usize, fast: bool) -> Self {
-        let direct = if combine == 0 { cap } else { 0 };
+    fn new(cap: usize, combine: usize, fast: bool, arena: Option<ArenaPart>) -> Self {
+        let direct = if combine == 0 && arena.is_none() {
+            cap
+        } else {
+            0
+        };
         let frames = (combine != 0).then(|| {
             Box::new(Frames {
                 output: Vec::with_capacity(cap.div_ceil(16)),
@@ -351,6 +429,7 @@ impl Part {
             rows: Vec::with_capacity(direct),
             extra: Vec::new(),
             frames,
+            arena,
         }
     }
 
@@ -359,6 +438,11 @@ impl Part {
         if let Some(frames) = &mut self.frames {
             frames.push(id, row);
         } else {
+            if let Some(lane) = &mut self.arena {
+                if lane.push(id, row) {
+                    return;
+                }
+            }
             self.ids.push(id);
             self.rows.push(row);
         }
@@ -368,15 +452,19 @@ impl Part {
         if let Some(frames) = &self.frames {
             frames.output.len() * 16 + frames.count
         } else {
-            self.ids.len()
+            self.ids.len() + self.arena.as_ref().map_or(0, |part| part.used)
         }
     }
 
     fn keys_and_rows(&self) -> impl Iterator<Item = (Key, Payload)> + '_ {
-        self.ids
-            .iter()
+        let (keys, rows) = self
+            .arena
+            .as_ref()
+            .map_or((&[][..], &[][..]), ArenaPart::split);
+        keys.iter()
             .copied()
-            .zip(self.rows.iter().copied())
+            .zip(rows.iter().copied())
+            .chain(self.ids.iter().copied().zip(self.rows.iter().copied()))
             .chain(self.frames.iter().flat_map(|frames| {
                 frames
                     .output
@@ -392,9 +480,10 @@ impl Part {
     }
 
     fn ids(&self) -> impl Iterator<Item = Key> + '_ {
-        self.ids
-            .iter()
+        let keys = self.arena.as_ref().map_or(&[][..], |part| part.split().0);
+        keys.iter()
             .copied()
+            .chain(self.ids.iter().copied())
             .chain(self.frames.iter().flat_map(|frames| {
                 frames
                     .output
@@ -589,6 +678,8 @@ pub(crate) fn pipeline(
     let divisor = setting("SHOPPING_DENSE_DIVISOR", 768).clamp(16, 4096);
     let combine = setting("SHOPPING_SW_COMBINE", 0).min(2);
     let combine_out = setting("SHOPPING_PERSON_COMBINE", 0).min(2);
+    let arena = setting("SHOPPING_PARSE_ARENA", 0).min(2);
+    let backing = setting("SHOPPING_ARENA_DIVISOR", 64).clamp(32, 128);
     let reuse = setting("SHOPPING_REUSE_SCRATCH", 0) != 0;
     let bits = setting("SHOPPING_DEDUP_BITS", 16).clamp(2, 64);
     let cache = setting("SHOPPING_NAME_CACHE", 0).min(4096);
@@ -622,14 +713,30 @@ pub(crate) fn pipeline(
             });
         }
         let cap = input.bytes() / 72 / partitions / threads;
+        let arena_cap =
+            ((input.bytes() / backing / partitions / threads).max(32)).next_multiple_of(32);
         input::jobs_finish(
             tasks,
             threads,
             |_| {
+                let memory =
+                    (arena != 0 && combine == 0).then(|| ParseArena::new(partitions, arena_cap));
                 (
                     Emitter {
                         bins: (0..partitions)
-                            .map(|_| Part::new(cap, combine, fast))
+                            .map(|part| {
+                                Part::new(
+                                    cap,
+                                    combine,
+                                    fast,
+                                    memory.as_ref().map(|region| ArenaPart {
+                                        arena: Arc::clone(region),
+                                        offset: part * arena_cap * 20,
+                                        limit: arena_cap,
+                                        used: 0,
+                                    }),
+                                )
+                            })
                             .collect(),
                         people: &people,
                         aliases: &aliases,
@@ -642,9 +749,10 @@ pub(crate) fn pipeline(
                         .map(|_| Output::<Click, 8>::new(combine_out, fast))
                         .collect::<Vec<_>>(),
                     Vec::new(),
+                    memory,
                 )
             },
-            |(emit, dates, buffer, clicks, temporary), task| match task {
+            |(emit, dates, buffer, clicks, temporary, _), task| match task {
                 Scan::Events(chunk) => {
                     let bytes = chunk.read(buffer);
                     if fast {
@@ -688,7 +796,9 @@ pub(crate) fn pipeline(
         )
     });
     let (mut parts, mut click_lanes) = (super::columns(partitions), Vec::new());
-    for (emit, _, _, clicks, _) in lanes {
+    let mut arenas = Vec::new();
+    for (emit, _, _, clicks, _, arena) in lanes {
+        arenas.push(arena);
         for (part, lane) in parts.iter_mut().zip(emit.bins) {
             part.push(lane);
         }
@@ -731,6 +841,21 @@ pub(crate) fn pipeline(
         .into_iter()
         .map(|buf| Mutex::new(Some(buf)))
         .collect();
+    let arenas: Vec<_> = arenas
+        .into_iter()
+        .map(|region| {
+            let region = if arena == 2 {
+                region.map(|owned| {
+                    Arc::try_unwrap(owned)
+                        .ok()
+                        .expect("all parse parts were dropped")
+                })
+            } else {
+                None
+            };
+            Mutex::new(region)
+        })
+        .collect();
     let count = people.count().div_ceil(shards);
     let partial = input::jobs_finish(
         work,
@@ -742,7 +867,11 @@ pub(crate) fn pipeline(
                 .unwrap_or_default();
             (
                 Totals::new(catalog.categories.len(), catalog.channels.len(), start, end),
-                crate::aggregate::DenseScratch::new(backing, reuse),
+                crate::aggregate::DenseScratch::new(
+                    backing,
+                    reuse,
+                    arenas.get(thread).and_then(|v| v.lock().unwrap().take()),
+                ),
             )
         },
         |(totals, scratch), (events, clicks)| {

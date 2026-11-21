@@ -184,14 +184,20 @@ pub(crate) struct DenseScratch {
     es: Vec<u64>,
     cs: Vec<Touch>,
     reuse: bool,
+    arena: Option<crate::compact::ParseArena>,
 }
 impl DenseScratch {
-    pub(crate) fn new(es: Vec<u64>, reuse: bool) -> Self {
+    pub(crate) fn new(
+        es: Vec<u64>,
+        reuse: bool,
+        arena: Option<crate::compact::ParseArena>,
+    ) -> Self {
         Self {
             index: Vec::new(),
             es,
             cs: Vec::new(),
             reuse,
+            arena,
         }
     }
 }
@@ -407,13 +413,20 @@ impl Totals {
         };
         es.clear();
         cs.clear();
-        es.reserve(n);
+        let mut mapped = scratch.arena.as_mut().and_then(|arena| arena.words(n));
+        let event_base = if let Some(words) = &mut mapped {
+            words.as_mut_ptr()
+        } else {
+            es.reserve(n);
+            if !scratch.reuse {
+                es.resize(n, 0);
+            }
+            es.as_mut_ptr()
+        };
         cs.reserve(coff);
         if !scratch.reuse {
-            es.resize(n, 0);
             cs.resize(coff, Touch::default());
         }
-        let event_base = es.as_mut_ptr();
         let click_base = cs.as_mut_ptr();
         for rows in &mut events {
             rows.walk(|event| {
@@ -442,12 +455,19 @@ impl Totals {
         }
         // Each prefix slot was initialized exactly once by the scatter above.
         unsafe {
-            es.set_len(n);
+            if mapped.is_none() {
+                es.set_len(n);
+            }
             cs.set_len(coff);
         }
+        let events = if let Some(words) = mapped {
+            words
+        } else {
+            es.as_mut_slice()
+        };
         let (mut e, mut c) = (0, 0);
         for (person, end_e, end_c) in groups {
-            let events = &mut es[e..end_e];
+            let events = &mut events[e..end_e];
             let clicks = &mut cs[c..end_c];
             events.sort_unstable();
             clicks.sort_unstable_by_key(|x| x.t);

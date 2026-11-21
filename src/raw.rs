@@ -174,30 +174,35 @@ unsafe fn hms<const CHECK: bool>(p: Ptr) -> i64 {
     }
 }
 
+/// A 16-byte readable span is guaranteed by the row decoder. Only the
+/// first thirteen lanes are part of the timestamp.
 #[inline(always)]
-fn digits8(word: u64) -> u64 {
-    let raw = word ^ 0x3030303030303030;
-    if raw & 0xf0f0f0f0f0f0f0f0 != 0
-        || raw.wrapping_add(0x0606060606060606) & 0x1010101010101010 != 0
-    {
-        return u64::MAX;
+unsafe fn epoch_millis(p: Ptr) -> i64 {
+    unsafe {
+        let bytes = _mm_loadu_si128(p.cast());
+        let digits = _mm_sub_epi8(bytes, _mm_set1_epi8(b'0' as i8));
+        // Unsigned digits > 9 clamp to 9, including wrapped values below '0'.
+        let exact = _mm_cmpeq_epi8(digits, _mm_min_epu8(digits, _mm_set1_epi8(9)));
+        if _mm_movemask_epi8(exact) & 0x1fff != 0x1fff {
+            return INVALID;
+        }
+        let digits = _mm_shuffle_epi8(
+            digits, _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, -1, -1, -1, 8, 9, 10, 11, 12),
+        );
+        let pairs = _mm_maddubs_epi16(digits, _mm_set1_epi16(0x010a));
+        let quads = _mm_madd_epi16(pairs, _mm_set1_epi32(0x00010064));
+        let words = _mm_packus_epi32(quads, quads);
+        let parts = _mm_madd_epi16(words, _mm_set1_epi32(0x00012710));
+        let parts = _mm_cvtsi128_si64(parts) as u64;
+        (i64::from(parts as u32) * 100_000) + (parts >> 32) as i64
     }
-    let pairs = raw.wrapping_mul(10).wrapping_add(raw >> 8) & 0x00ff00ff00ff00ff;
-    let quads = pairs.wrapping_mul(100).wrapping_add(pairs >> 16) & 0x0000ffff0000ffff;
-    (quads.wrapping_mul(10000).wrapping_add(quads >> 32)) & 0xffff_ffff
 }
 
 #[inline(always)]
 unsafe fn stamp<const WIDTH: usize>(p: Ptr, calendar: &Calendar) -> i64 {
     unsafe {
         if WIDTH == 13 {
-            let hi = digits8(word(p));
-            let lo = digits8((word(p.add(5)) & !0xff_ffff) | 0x30_3030);
-            return if hi == u64::MAX || lo == u64::MAX {
-                INVALID
-            } else {
-                (hi * 100_000 + lo) as i64
-            };
+            return epoch_millis(p);
         }
         let day = calendar.day(p);
         let time = hms::<true>(p);
@@ -794,6 +799,29 @@ unsafe fn link_loop(data: &[u8], keys: &Keys, pair: &mut impl FnMut(u64, u64)) {
             let row = std::slice::from_raw_parts(p, next.offset_from(p) as usize);
             crate::links(row, keys, &mut *pair);
             p = next;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{INVALID, epoch_millis};
+
+    #[test]
+    fn epoch_millis_requires_thirteen_ascii_digits() {
+        for millis in [0, 1, 86_400_001, 1_707_724_800_123, 9_999_999_999_999] {
+            let mut bytes = format!("{millis:013}").into_bytes();
+            // The SIMD load can see following CSV bytes but never parses them.
+            bytes.extend_from_slice(b"\x22,\xff");
+            assert_eq!(unsafe { epoch_millis(bytes.as_ptr()) }, millis);
+            for i in 0..13 {
+                let saved = bytes[i];
+                for bad in [0, b'/', b':', b' ', b'\x22', 0xff] {
+                    bytes[i] = bad;
+                    assert_eq!(unsafe { epoch_millis(bytes.as_ptr()) }, INVALID);
+                }
+                bytes[i] = saved;
+            }
         }
     }
 }

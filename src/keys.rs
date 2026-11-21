@@ -59,8 +59,11 @@ struct Long {
     ids: HashMap<Vec<u8>, u64>,
     strings: Vec<Vec<u8>>,
 }
+const SHARD_BITS: u32 = 5;
+const SHARDS: usize = 1 << SHARD_BITS;
+
 #[derive(Default)]
-pub struct Keys(Mutex<Long>);
+pub struct Keys([Mutex<Long>; SHARDS]);
 impl Keys {
     #[inline(always)]
     pub fn key(&self, s: &[u8]) -> Key {
@@ -90,11 +93,21 @@ impl Keys {
     #[cold]
     #[inline(never)]
     fn intern(&self, s: &[u8]) -> Key {
-        let mut pool = self.0.lock().unwrap();
+        // IDs with a common prefix often differ near the end. Collisions only
+        // select the same lock; the map still compares the complete byte string.
+        let tail = if s.len() >= 8 {
+            u64::from_le_bytes(s[s.len() - 8..].try_into().unwrap())
+        } else {
+            let mut bytes = [0; 8];
+            bytes[..s.len()].copy_from_slice(s);
+            u64::from_le_bytes(bytes)
+        };
+        let shard = (mix(tail) >> (64 - SHARD_BITS)) as usize;
+        let mut pool = self.0[shard].lock().unwrap();
         if let Some(id) = pool.ids.get(s) {
             return *id;
         }
-        let id = EXTERNAL | pool.strings.len() as u64;
+        let id = EXTERNAL | ((pool.strings.len() as u64) << SHARD_BITS) | shard as u64;
         pool.strings.push(s.to_vec());
         pool.ids.insert(s.to_vec(), id);
         id
@@ -106,7 +119,9 @@ impl Keys {
     }
     pub fn append_bytes(&self, k: Key, out: &mut Vec<u8>) {
         if k & EXTERNAL != 0 {
-            out.extend_from_slice(&self.0.lock().unwrap().strings[(k ^ EXTERNAL) as usize]);
+            let shard = k as usize & (SHARDS - 1);
+            let index = ((k ^ EXTERNAL) >> SHARD_BITS) as usize;
+            out.extend_from_slice(&self.0[shard].lock().unwrap().strings[index]);
             return;
         }
         let packed = k & LOW;

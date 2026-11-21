@@ -47,39 +47,110 @@ pub fn jobs_finish<T: Send, R: Send, S: Send>(
     })
 }
 
-pub struct Input(Vec<Mmap>);
+struct Source {
+    mapping: Mmap,
+    direct: Option<File>,
+}
+
+pub struct Input(Vec<Source>);
+// Both the starting offset and request size are multiples of a disk page.
+const STEP: usize = 2 << 20;
+const OVERLAP: usize = 4096;
+
+pub struct ReadBuffer(memmap2::MmapMut);
+impl ReadBuffer {
+    pub fn new() -> Self {
+        Self(memmap2::MmapMut::map_anon(STEP + OVERLAP).unwrap())
+    }
+}
+
+fn major_faults() -> Option<i64> {
+    let mut usage = std::mem::MaybeUninit::uninit();
+    // getrusage initializes the whole structure on success.
+    let rc = unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) };
+    (rc == 0).then(|| unsafe { usage.assume_init() }.ru_majflt)
+}
+
+fn is_cold(mapping: &Mmap) -> bool {
+    if mapping.len() < STEP {
+        return false;
+    }
+    let Some(before) = major_faults() else {
+        return false;
+    };
+    // A new mapping of resident pages faults them in without disk I/O.
+    // Sample separated pages of the largest shard before issuing readahead.
+    for i in [1, 2, 3] {
+        unsafe {
+            std::ptr::read_volatile(&mapping[(mapping.len() / 4) * i]);
+        }
+    }
+    major_faults().is_some_and(|after| after - before >= 2)
+}
+
 impl Input {
     pub fn open(path: &Path) -> Self {
+        Self::open_mode(path, false)
+    }
+
+    pub fn open_for_scan(path: &Path) -> Self {
+        Self::open_mode(path, true)
+    }
+
+    fn open_mode(path: &Path, sample_cache: bool) -> Self {
+        use std::os::unix::fs::OpenOptionsExt;
         let mut paths = if path.is_dir() {
             fs::read_dir(path)
                 .unwrap()
-                .map(|p| p.unwrap().path())
-                .filter(|p| p.extension().is_some_and(|s| s == "csv"))
-                .collect()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| path.extension().is_some_and(|ext| ext == "csv"))
+                .collect::<Vec<_>>()
         } else {
             vec![path.to_owned()]
         };
         paths.sort_unstable();
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            let file = File::open(&path).unwrap();
+            if file.metadata().unwrap().len() != 0 {
+                // The scorer mounts immutable input files.
+                let mapping = unsafe { Mmap::map(&file).unwrap() };
+                files.push((path, mapping));
+            }
+        }
+        let direct = sample_cache
+            && files
+                .iter()
+                .max_by_key(|(_, m)| m.len())
+                .is_some_and(|(_, m)| is_cold(m));
         Self(
-            paths
+            files
                 .into_iter()
-                .filter_map(|p| {
-                    let f = File::open(p).unwrap();
-                    // The scorer mounts immutable input files.
-                    (f.metadata().unwrap().len() != 0).then(|| {
-                        let map = unsafe { Mmap::map(&f).unwrap() };
-                        let _ = map.advise(memmap2::Advice::Sequential);
-                        map
-                    })
+                .map(|(path, mapping)| {
+                    let _ = mapping.advise(memmap2::Advice::Sequential);
+                    let direct = if direct && mapping.len() >= OVERLAP {
+                        File::options()
+                            .read(true)
+                            .custom_flags(libc::O_DIRECT)
+                            .open(path)
+                            .ok()
+                    } else {
+                        None
+                    };
+                    Source { mapping, direct }
                 })
                 .collect(),
         )
     }
     pub fn bytes(&self) -> usize {
-        self.0.iter().map(|m| m.len()).sum()
+        self.0.iter().map(|s| s.mapping.len()).sum()
     }
     pub fn prefetch(&self, lane: usize, lanes: usize) {
         for file in self.0.iter().skip(lane).step_by(lanes) {
+            if file.direct.is_some() {
+                continue;
+            }
+            let file = &file.mapping;
             // Linux caps a single speculative read. Queue the file in order.
             const WINDOW: usize = 8 << 20;
             for off in (0..file.len()).step_by(WINDOW) {
@@ -92,12 +163,13 @@ impl Input {
         }
     }
     pub fn chunks(&self) -> Vec<Chunk<'_>> {
-        const STEP: usize = 1 << 20;
         self.0
             .iter()
-            .flat_map(|file| {
+            .flat_map(|source| {
+                let file = &source.mapping;
                 (0..file.len()).step_by(STEP).map(|start| Chunk {
                     file,
+                    direct: source.direct.as_ref(),
                     start,
                     end: (start + STEP).min(file.len()),
                 })
@@ -109,25 +181,45 @@ impl Input {
 #[derive(Clone, Copy)]
 pub struct Chunk<'a> {
     file: &'a [u8],
+    direct: Option<&'a File>,
     start: usize,
     end: usize,
 }
 impl<'a> Chunk<'a> {
-    // A row belongs to the chunk containing its preceding LF. This skips
-    // exactly one header per file, even when a single row spans many chunks.
-    pub fn records(self) -> &'a [u8] {
-        let Some(first) = self.file[self.start..self.end]
-            .iter()
-            .position(|&b| b == 10)
-        else {
-            return &[];
-        };
-        let stop = self.file[self.end..]
-            .iter()
-            .position(|&b| b == 10)
-            .map_or(self.file.len(), |n| self.end + n + 1);
-        &self.file[self.start + first + 1..stop]
+    pub fn read<'b>(&'b self, buf: &'b mut ReadBuffer) -> &'b [u8] {
+        use std::os::unix::fs::FileExt;
+        if let Some(fd) = self.direct {
+            let remaining = self.file.len() - self.start;
+            let wanted = remaining.min(buf.0.len());
+            if fd.read_at(&mut buf.0, self.start as u64).ok() == Some(wanted) {
+                if let Some(rows) =
+                    owned_records(&buf.0[..wanted], self.end - self.start, wanted == remaining)
+                {
+                    return rows;
+                }
+            }
+        }
+        // A short read, unsupported I/O or a long boundary row uses the mapping.
+        self.records()
     }
+
+    pub fn records(self) -> &'a [u8] {
+        owned_records(&self.file[self.start..], self.end - self.start, true).unwrap()
+    }
+}
+
+// A row belongs to the chunk containing its preceding LF. The virtual start of
+// each file has no LF, so the header is skipped. The last row may end at EOF.
+fn owned_records(bytes: &[u8], body: usize, at_eof: bool) -> Option<&[u8]> {
+    let Some(header) = bytes[..body].iter().position(|&c| c == b'\n') else {
+        return Some(&[]);
+    };
+    let stop = match bytes[body..].iter().position(|&c| c == b'\n') {
+        Some(extra) => body + extra + 1,
+        None if at_eof => bytes.len(),
+        None => return None,
+    };
+    Some(&bytes[header + 1..stop])
 }
 
 #[target_feature(enable = "avx2")]
@@ -587,6 +679,7 @@ mod tests {
                     .step_by(step)
                     .flat_map(|start| {
                         Chunk {
+                            direct: None,
                             file,
                             start,
                             end: (start + step).min(file.len()),
@@ -599,6 +692,26 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn bounded_reads_preserve_long_boundary_rows_and_eof() {
+        let mut bytes = b"header\n".to_vec();
+        bytes.extend(std::iter::repeat_n(b'x', OVERLAP + 64));
+        bytes.extend_from_slice(b"\nfirst\nlast");
+        for step in [1, 15, 64, OVERLAP, bytes.len()] {
+            let mut actual = Vec::new();
+            for start in (0..bytes.len()).step_by(step) {
+                let body = step.min(bytes.len() - start);
+                let wanted = (body + 8).min(bytes.len() - start);
+                let block = &bytes[start..start + wanted];
+                let eof = start + wanted == bytes.len();
+                let rows = owned_records(block, body, eof)
+                    .unwrap_or_else(|| owned_records(&bytes[start..], body, true).unwrap());
+                actual.extend_from_slice(rows);
+            }
+            assert_eq!(actual, &bytes[7..]);
+        }
+    }
+
     #[test]
     fn quotes_and_delimiters_at_vector_boundaries() {
         let mut data = Vec::new();

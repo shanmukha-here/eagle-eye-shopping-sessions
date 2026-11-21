@@ -127,9 +127,19 @@ impl Catalog {
     }
 }
 
-// All ingest dates are four-digit Gregorian years. Their Unix seconds
-// plus this offset fit in 39 bits, leaving 24 bits for a valid purchase.
-const INGEST_BIAS: i64 = 70_000_000_000;
+// Most rows have no sale and an ingest date near the reporting window.
+const SIDE: u32 = 1 << 31;
+const ARRIVAL_BIAS: i64 = (SIDE / 2) as i64;
+#[derive(Clone, Copy)]
+struct Detail {
+    arrival: i64,
+    cents: u32,
+    category: u32,
+}
+struct Bucket<T> {
+    rows: Vec<Candidate<T>>,
+    extra: Vec<Detail>,
+}
 trait EventTime: Copy + Send {
     fn pack(t: i64, start: i64) -> Self;
     fn unpack(self, start: i64) -> Option<i64>;
@@ -162,9 +172,8 @@ impl EventTime for i64 {
 struct Candidate<T> {
     id: Key,
     user: Key,
-    ingest_price: u64,
+    arrival: u32,
     t: T,
-    cat: u32,
 }
 
 fn events<T: EventTime>(
@@ -174,7 +183,7 @@ fn events<T: EventTime>(
     catalog: &Catalog,
     start: i64,
     end: i64,
-    partitions: &mut [Vec<Candidate<T>>],
+    partitions: &mut [Bucket<T>],
 ) {
     rows::<7>(
         chunk,
@@ -187,12 +196,13 @@ fn events<T: EventTime>(
             // reversible XOR shifts). Its full value remains an exact event ID.
             let id = mix(keys.key(f[0]));
             let (instant, ingest) = dates.event_times(f[2], f[3]);
+            let mut cents = 0;
+            let mut category = 0;
             let mut candidate = Candidate {
                 id,
                 user: 0,
-                ingest_price: ((ingest / 1000 + INGEST_BIAS) as u64) << 24,
+                arrival: 0,
                 t: T::pack(INVALID, start),
-                cat: 0,
             };
             // Even a semantically invalid earliest copy must win deduplication.
             if let Some(t) = instant.filter(|&t| t >= start && t < end && t >= ingest - DAY) {
@@ -201,8 +211,8 @@ fn events<T: EventTime>(
                         b"view" | b"cart" => true,
                         b"purchase" => match input::decimal(f[6], 10_000_000).filter(|&p| p != 0) {
                             Some(price) => {
-                                candidate.ingest_price |= price;
-                                candidate.cat =
+                                cents = price as u32;
+                                category =
                                     catalog.products.get(keys, f[5]).unwrap_or(catalog.unknown);
                                 true
                             }
@@ -217,18 +227,33 @@ fn events<T: EventTime>(
                 }
             }
             let bucket = (id as usize) & (partitions.len() - 1);
-            partitions[bucket].push(candidate);
+            let bin = &mut partitions[bucket];
+            let arrival = ingest / 1000;
+            let offset = arrival - start / 1000 + ARRIVAL_BIAS;
+            candidate.arrival = if cents == 0 && (offset as u64) < u64::from(SIDE) {
+                offset as u32
+            } else {
+                // Each side entry is 16 bytes. Its index fits within the 24 GiB cap.
+                let index = bin.extra.len() as u32;
+                bin.extra.push(Detail {
+                    arrival,
+                    cents,
+                    category,
+                });
+                SIDE | index
+            };
+            bin.rows.push(candidate);
         },
     );
 }
 
 fn winners<T: EventTime>(
-    parts: Vec<Vec<Candidate<T>>>,
+    parts: Vec<Bucket<T>>,
     people: &Aliases,
     out: &mut [Vec<Event>],
     start: i64,
 ) {
-    let count = parts.iter().map(Vec::len).sum::<usize>();
+    let count = parts.iter().map(|bin| bin.rows.len()).sum::<usize>();
     if count == 0 {
         return;
     }
@@ -238,50 +263,59 @@ fn winners<T: EventTime>(
     let mut seen = vec![0u64; bits / 64];
     let mut collisions = vec![0u64; bits / 64];
     let index = |key: u64| (key >> 20) as usize & (bits - 1);
-    for e in parts.iter().flatten() {
+    for e in parts.iter().flat_map(|bin| &bin.rows) {
         let i = index(e.id);
         let mask = 1u64 << (i % 64);
         collisions[i / 64] |= seen[i / 64] & mask;
         seen[i / 64] |= mask;
     }
-    let mut emit = |e: Candidate<T>| {
+    let mut emit = |e: Candidate<T>, d: Detail| {
         if let Some(t) = e.t.unpack(start) {
             let u = people.canonical(e.user);
             let shard = u as usize & (out.len() - 1);
             out[shard].push(Event {
                 u,
                 t,
-                cents: (e.ingest_price & 0xffffff) as u32,
-                cat: e.cat,
+                cents: d.cents,
+                cat: d.category,
             });
         }
     };
-    let mut repeated = IntMap::<Candidate<T>>::default();
+    let mut repeated = IntMap::<(Candidate<T>, Detail)>::default();
     repeated.reserve(count / 8);
-    for copies in parts {
-        for block in copies.chunks(32) {
+    for bin in parts {
+        for block in bin.rows.chunks(32) {
             for e in block {
                 people.prefetch(e.user);
             }
             for &e in block {
+                let d = if e.arrival & SIDE == 0 {
+                    Detail {
+                        arrival: i64::from(e.arrival) + start / 1000 - ARRIVAL_BIAS,
+                        cents: 0,
+                        category: 0,
+                    }
+                } else {
+                    bin.extra[(e.arrival ^ SIDE) as usize]
+                };
                 let i = index(e.id);
                 if collisions[i / 64] & (1u64 << (i % 64)) == 0 {
-                    emit(e);
+                    emit(e, d);
                 } else {
                     repeated
                         .entry(e.id)
                         .and_modify(|old| {
-                            if e.ingest_price < old.ingest_price {
-                                *old = e
+                            if d.arrival < old.1.arrival {
+                                *old = (e, d)
                             }
                         })
-                        .or_insert(e);
+                        .or_insert((e, d));
                 }
             }
         }
     }
-    for e in repeated.into_values() {
-        emit(e);
+    for (e, d) in repeated.into_values() {
+        emit(e, d);
     }
 }
 
@@ -326,14 +360,14 @@ fn pipeline<T: EventTime>(
 ) {
     let keys = Keys::default();
     let catalog = Catalog::read(data, &keys);
-    let raw = Input::open(&data.join("events"));
+    let raw = Input::open_for_scan(&data.join("events"));
     let n = ((raw.bytes() / (6 << 20)).max(1))
         .next_power_of_two()
         .min(4096);
     let people = std::sync::OnceLock::new();
     let mut tasks = vec![None];
     tasks.extend(raw.chunks().into_iter().map(Some));
-    let click_input = Input::open(&data.join("clicks"));
+    let click_input = Input::open_for_scan(&data.join("clicks"));
     let lanes = std::thread::scope(|scope| {
         let readers = threads.min(4);
         for lane in 0..readers {
@@ -352,14 +386,18 @@ fn pipeline<T: EventTime>(
                 (
                     Dates::new(),
                     (0..n)
-                        .map(|_| Vec::with_capacity(expected))
+                        .map(|_| Bucket {
+                            rows: Vec::with_capacity(expected),
+                            extra: Vec::new(),
+                        })
                         .collect::<Vec<_>>(),
+                    input::ReadBuffer::new(),
                 )
             },
             |s, task| {
                 if let Some(chunk) = task {
                     events(
-                        chunk.records(),
+                        chunk.read(&mut s.2),
                         &mut s.0,
                         &keys,
                         &catalog,
@@ -387,12 +425,17 @@ fn pipeline<T: EventTime>(
         )
     });
     let people = people.into_inner().unwrap();
-    let parts = transpose(lanes.into_iter().map(|s| s.1).collect(), n);
+    let mut parts = columns(n);
+    for (_, lane, _) in lanes {
+        for (part, bucket) in parts.iter_mut().zip(lane) {
+            part.push(bucket);
+        }
+    }
     drop(raw);
     stage("event parse and identity graph");
     let person_shards = n.min(512);
     enum Work<'a, T> {
-        Copies(Vec<Vec<Candidate<T>>>),
+        Copies(Vec<Bucket<T>>),
         Clicks(input::Chunk<'a>),
     }
     let mut copies = parts.into_iter();
@@ -409,12 +452,19 @@ fn pipeline<T: EventTime>(
     let lanes = jobs(
         tasks,
         threads,
-        |_| (Dates::new(), columns(person_shards), columns(person_shards)),
+        |_| {
+            (
+                Dates::new(),
+                columns(person_shards),
+                columns(person_shards),
+                input::ReadBuffer::new(),
+            )
+        },
         |s, task| match task {
             Work::Copies(part) => winners::<T>(part, &people, &mut s.1, start),
             Work::Clicks(chunk) => {
                 rows::<4>(
-                    chunk.records(),
+                    chunk.read(&mut s.3),
                     #[inline(always)]
                     |f| {
                         if f[0].is_empty() || f[1].is_empty() {
@@ -442,7 +492,7 @@ fn pipeline<T: EventTime>(
             }
         },
     );
-    let (events, clicks): (Vec<_>, Vec<_>) = lanes.into_iter().map(|(_, e, c)| (e, c)).unzip();
+    let (events, clicks): (Vec<_>, Vec<_>) = lanes.into_iter().map(|(_, e, c, _)| (e, c)).unzip();
     let event_parts = transpose(events, person_shards);
     let click_parts = transpose(clicks, person_shards);
     drop(click_input);

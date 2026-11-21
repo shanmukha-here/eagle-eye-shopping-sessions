@@ -1,0 +1,381 @@
+//! Event keys have their own stream. After copy reduction only the dense
+//! person, time and packed purchase fields remain.
+use crate::{
+    ARRIVAL_BIAS, Candidate, Catalog, Detail, EventSink, Keys, SIDE, Totals, events, finish,
+    input::{self, Dates, Input, jobs},
+    keys::{self, Aliases, IntMap, Key},
+    output, raw, read_people, transpose,
+};
+use std::{
+    path::Path,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
+};
+
+#[derive(Default)]
+struct Overflow {
+    ids: IntMap<u32>,
+    names: Vec<Key>,
+}
+
+pub(crate) struct DensePeople {
+    // A new non-alias owns its slot. Linked keys know the exact root slot.
+    table: Vec<AtomicU64>,
+    roots: Vec<u32>,
+    overflow: Mutex<Overflow>,
+}
+impl DensePeople {
+    fn new(original: &Aliases, bytes: usize, divisor: usize) -> Self {
+        let entries = original.entries().count();
+        let n = (bytes / divisor + entries * 4 + 16)
+            .next_power_of_two()
+            .min(1 << 25);
+        let mut people = Self {
+            table: (0..n).map(|_| AtomicU64::new(0)).collect(),
+            roots: vec![0; n],
+            overflow: Mutex::default(),
+        };
+        for (_, root) in original.entries() {
+            people.index(root);
+        }
+        for (alias, root) in original.entries() {
+            let id = people.index(alias) as usize;
+            let root = people.index(root);
+            if let Some(target) = people.roots.get_mut(id) {
+                *target = root + 1;
+            }
+        }
+        people
+    }
+
+    #[inline]
+    fn index(&self, key: Key) -> u32 {
+        debug_assert_ne!(key, 0);
+        let mask = self.table.len() - 1;
+        let mut idx = key as usize & mask;
+        for _ in 0..128 {
+            let entry = &self.table[idx];
+            let old = entry.load(Relaxed);
+            if old == key {
+                return idx as u32;
+            }
+            if old == 0 {
+                match entry.compare_exchange(0, key, Relaxed, Relaxed) {
+                    Ok(_) => return idx as u32,
+                    Err(current) if current == key => return idx as u32,
+                    _ => {}
+                }
+            }
+            idx = (idx + 1) & mask;
+        }
+        let mut spill = self.overflow.lock().unwrap();
+        if let Some(&idx) = spill.ids.get(&key) {
+            return idx;
+        }
+        let idx = (self.table.len() + spill.names.len()) as u32;
+        spill.ids.insert(key, idx);
+        spill.names.push(key);
+        idx
+    }
+
+    #[inline]
+    fn person(&self, key: Key, aliases: &Aliases) -> u32 {
+        let id = self.index(key);
+        if let Some(&root) = self.roots.get(id as usize) {
+            return if root == 0 { id } else { root - 1 };
+        }
+        // Rare clustered identifiers can overflow the fixed slot array.
+        self.index(aliases.canonical(key))
+    }
+
+    pub(crate) fn key(&self, person: u32) -> Key {
+        let i = person as usize;
+        let mixed = if let Some(k) = self.table.get(i) {
+            k.load(Relaxed)
+        } else {
+            self.overflow.lock().unwrap().names[i - self.table.len()]
+        };
+        keys::unmix(mixed)
+    }
+
+    fn count(&self) -> usize {
+        self.table.len() + self.overflow.lock().unwrap().names.len()
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Event {
+    pub person: u32,
+    pub ts: u32,
+    pub purchase: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Payload {
+    person: u32,
+    ts: u32,
+    arrival: u32,
+}
+
+struct Part {
+    ids: Vec<Key>,
+    rows: Vec<Payload>,
+    extra: Vec<Detail>,
+}
+impl Part {
+    fn new(cap: usize) -> Self {
+        Self {
+            ids: Vec::with_capacity(cap),
+            rows: Vec::with_capacity(cap),
+            extra: Vec::new(),
+        }
+    }
+}
+
+struct Emitter<'a> {
+    bins: Vec<Part>,
+    people: &'a DensePeople,
+    aliases: &'a Aliases,
+}
+impl EventSink<u32> for Emitter<'_> {
+    #[inline(always)]
+    fn push(&mut self, row: Candidate<u32>, detail: Option<Detail>) {
+        let bin = row.id as usize & (self.bins.len() - 1);
+        let part = &mut self.bins[bin];
+        let arrival = if let Some(detail) = detail {
+            let index = part.extra.len() as u32;
+            part.extra.push(detail);
+            SIDE | index
+        } else {
+            row.arrival
+        };
+        let person = if row.t == u32::MAX {
+            0
+        } else {
+            self.people.person(row.user, self.aliases)
+        };
+        part.ids.push(row.id);
+        part.rows.push(Payload {
+            person,
+            ts: row.t,
+            arrival,
+        });
+    }
+}
+
+#[inline]
+fn arrival(row: Payload, part: &Part) -> i64 {
+    if row.arrival & SIDE == 0 {
+        i64::from(row.arrival)
+    } else {
+        part.extra[(row.arrival ^ SIDE) as usize].arrival
+    }
+}
+
+#[inline]
+fn send(row: Payload, part: &Part, out: &mut [Vec<Event>]) {
+    if row.ts == u32::MAX {
+        return;
+    }
+    let purchase = if row.arrival & SIDE != 0 {
+        let d = part.extra[(row.arrival ^ SIDE) as usize];
+        (d.category << 24) | d.cents
+    } else {
+        0
+    };
+    let shard = row.person as usize & (out.len() - 1);
+    out[shard].push(Event {
+        person: row.person,
+        ts: row.ts,
+        purchase,
+    });
+}
+
+fn reduce(parts: Vec<Part>, out: &mut [Vec<Event>], origin: i64, bits_per_row: usize) {
+    let n = parts.iter().map(|p| p.ids.len()).sum::<usize>();
+    let bits = (n * bits_per_row).max(64).next_power_of_two();
+    let mut seen = vec![0u64; bits / 64];
+    let mut repeated = vec![0u64; bits / 64];
+    let index = |id: Key| (id >> 20) as usize & (bits - 1);
+    for part in &parts {
+        for &id in &part.ids {
+            let bit = index(id);
+            let mask = 1 << (bit % 64);
+            repeated[bit / 64] |= seen[bit / 64] & mask;
+            seen[bit / 64] |= mask;
+        }
+    }
+    let bias = origin / 1000 - ARRIVAL_BIAS;
+    let mut copies = IntMap::<(usize, Payload, i64)>::default();
+    copies.reserve(n / 8);
+    for (which, part) in parts.iter().enumerate() {
+        for (&key, &row) in part.ids.iter().zip(&part.rows) {
+            let bit = index(key);
+            if repeated[bit / 64] & (1 << (bit % 64)) == 0 {
+                send(row, part, out);
+                continue;
+            }
+            let offset = if row.arrival & SIDE == 0 { bias } else { 0 };
+            let t = arrival(row, part) + offset;
+            copies
+                .entry(key)
+                .and_modify(|old| {
+                    if t < old.2 {
+                        *old = (which, row, t);
+                    }
+                })
+                .or_insert((which, row, t));
+        }
+    }
+    for (which, row, _) in copies.into_values() {
+        send(row, &parts[which], out);
+    }
+}
+
+pub(crate) fn pipeline(
+    data: &Path,
+    out: &Path,
+    threads: usize,
+    start: i64,
+    end: i64,
+    keys: Keys,
+    catalog: Catalog,
+    mut stage: impl FnMut(&str),
+) -> ! {
+    let input = Input::open_for_scan(&data.join("events"));
+    let click_input = Input::open_for_scan(&data.join("clicks"));
+    let setting = |key, default| {
+        std::env::var(key)
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(default)
+    };
+    let partitions: usize = setting(
+        "SHOPPING_EVENT_PARTITIONS",
+        ((input.bytes() / (2 << 20)).max(1)).next_power_of_two(),
+    )
+    .clamp(1, 4096)
+    .next_power_of_two();
+    let shards: usize = setting("SHOPPING_PERSON_PARTITIONS", 256)
+        .clamp(1, 512)
+        .next_power_of_two();
+    let divisor = setting("SHOPPING_DENSE_DIVISOR", 768).clamp(16, 4096);
+    let bits = setting("SHOPPING_DEDUP_BITS", 16).clamp(2, 64);
+    let clock = raw::Calendar::new(start, end);
+    let fast = raw::available();
+    let aliases = read_people(data, &keys, threads, fast);
+    let people = DensePeople::new(&aliases, input.bytes() + click_input.bytes(), divisor);
+    stage("identity_dense");
+    enum Scan<'a> {
+        Events(input::Chunk<'a>),
+        Clicks(input::Chunk<'a>),
+    }
+    let tasks = input
+        .chunks()
+        .into_iter()
+        .map(Scan::Events)
+        .chain(click_input.chunks().into_iter().map(Scan::Clicks))
+        .collect();
+    let lanes = std::thread::scope(|scope| {
+        for lane in 0..threads.min(4) {
+            let (input, clicks) = (&input, &click_input);
+            scope.spawn(move || {
+                input.prefetch(lane, threads.min(4));
+                clicks.prefetch(lane, threads.min(4));
+            });
+        }
+        let cap = input.bytes() / 72 / partitions / threads;
+        jobs(
+            tasks,
+            threads,
+            |_| {
+                (
+                    Emitter {
+                        bins: (0..partitions).map(|_| Part::new(cap)).collect(),
+                        people: &people,
+                        aliases: &aliases,
+                    },
+                    Dates::new(),
+                    input::ReadBuffer::new(),
+                    super::columns(shards),
+                    Vec::new(),
+                )
+            },
+            |(emit, dates, buffer, clicks, temporary), task| match task {
+                Scan::Events(chunk) => {
+                    let bytes = chunk.read(buffer);
+                    if fast {
+                        raw::events(bytes, dates, &keys, &catalog, &clock, start, end, emit, 7);
+                    } else {
+                        events(bytes, dates, &keys, &catalog, start, end, emit);
+                    }
+                }
+                Scan::Clicks(chunk) => {
+                    raw::clicks(
+                        chunk.read(buffer),
+                        dates,
+                        &keys,
+                        &catalog,
+                        &clock,
+                        start,
+                        end,
+                        temporary,
+                        fast,
+                    );
+                    for mut click in temporary.drain(..) {
+                        let person = people.person(click.u, &aliases);
+                        click.u = u64::from(person);
+                        clicks[person as usize & (shards - 1)].push(click);
+                    }
+                }
+            },
+        )
+    });
+    let (mut parts, mut click_lanes) = (super::columns(partitions), Vec::new());
+    for (emit, _, _, clicks, _) in lanes {
+        for (part, lane) in parts.iter_mut().zip(emit.bins) {
+            part.push(lane);
+        }
+        click_lanes.push(clicks);
+    }
+    let release = std::thread::spawn(move || {
+        input.release();
+        click_input.release();
+    });
+    stage("compact_scan");
+    let winner_lanes = jobs(
+        parts,
+        threads,
+        |_| super::columns(shards),
+        |out, part| reduce(part, out, start, bits),
+    );
+    release.join().unwrap();
+    stage("compact_dedup_route");
+    let work = transpose(winner_lanes, shards)
+        .into_iter()
+        .zip(transpose(click_lanes, shards))
+        .enumerate()
+        .collect();
+    let count = people.count().div_ceil(shards);
+    let partial = input::jobs_finish(
+        work,
+        threads,
+        |_| Totals::new(catalog.categories.len(), catalog.channels.len(), start, end),
+        |totals, (_, (events, clicks))| {
+            totals.partition_dense(&keys, &people, events, clicks, shards, count);
+        },
+        |i, totals| {
+            output::users(
+                &out.join(format!("user_daily/part-{i}.parquet")),
+                &totals.users,
+                &keys,
+                &catalog.categories,
+            );
+            totals.days()
+        },
+    );
+    stage("dense_person_user_parquet");
+    finish(out, &catalog, partial, stage)
+}

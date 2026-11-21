@@ -2,7 +2,7 @@
 //! all rows that fail the shape, clock, or field checks.
 use crate::input::{DAY, Dates, INVALID, WEEK};
 use crate::keys::{Keys, mix, pack_ninth};
-use crate::{ARRIVAL_BIAS, Bucket, Candidate, Catalog, Click, EventTime, SIDE};
+use crate::{ARRIVAL_BIAS, Candidate, Catalog, Click, EventSink, EventTime, SIDE};
 use std::arch::x86_64::*;
 
 pub(super) fn available() -> bool {
@@ -304,7 +304,7 @@ unsafe fn decode_event<const LEVEL: usize, T: EventTime>(
     state: State<'_>,
     id: u64,
     user: u64,
-    emit: &mut [Bucket<T>],
+    emit: &mut (impl EventSink<T> + ?Sized),
 ) -> bool {
     unsafe {
         if time == INVALID {
@@ -342,8 +342,7 @@ unsafe fn decode_event<const LEVEL: usize, T: EventTime>(
             t: T::pack(if valid { time } else { INVALID }, state.start),
         };
         if LEVEL >= 7 {
-            let index = id as usize & (emit.len() - 1);
-            emit.get_unchecked_mut(index).rows.push(record);
+            emit.push(record, None);
         } else {
             std::hint::black_box(record);
         }
@@ -356,7 +355,7 @@ unsafe fn event<const LEVEL: usize, T: EventTime>(
     p: Ptr,
     end: Ptr,
     state: State<'_>,
-    emit: &mut [Bucket<T>],
+    emit: &mut (impl EventSink<T> + ?Sized),
 ) -> bool {
     unsafe {
         let (mut id, mut user) = (0, 0);
@@ -415,7 +414,7 @@ unsafe fn event_loop<const LEVEL: usize, T: EventTime>(
     keys: &Keys,
     catalog: &Catalog,
     state: State<'_>,
-    emit: &mut [Bucket<T>],
+    emit: &mut (impl EventSink<T> + ?Sized),
 ) -> [usize; 2] {
     unsafe {
         let limit = data.as_ptr().add(data.len());
@@ -453,7 +452,7 @@ pub(super) fn events<T: EventTime>(
     clock: &Calendar,
     start: i64,
     end: i64,
-    emit: &mut [Bucket<T>],
+    emit: &mut (impl EventSink<T> + ?Sized),
     level: usize,
 ) -> [usize; 2] {
     let state = State { clock, start, end };

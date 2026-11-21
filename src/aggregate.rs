@@ -327,6 +327,74 @@ impl Totals {
             self.counts[c as usize] = 0;
         }
     }
+    pub(crate) fn partition_dense(
+        &mut self,
+        keys: &Keys,
+        people: &crate::compact::DensePeople,
+        mut events: Vec<Vec<crate::compact::Event>>,
+        mut clicks: Vec<Vec<Click>>,
+        shards: usize,
+        max_people: usize,
+    ) {
+        let n = events.iter().map(Vec::len).sum();
+        if n == 0 {
+            return;
+        }
+        let mut index = vec![0u32; max_people];
+        let mut groups = Vec::<(u32, usize, usize)>::new();
+        let shift = shards.trailing_zeros();
+        for event in events.iter_mut().flatten() {
+            let slot = &mut index[(event.person >> shift) as usize];
+            if *slot == 0 {
+                groups.push((event.person, 0, 0));
+                *slot = groups.len() as u32;
+            }
+            event.person = *slot - 1;
+            groups[event.person as usize].1 += 1;
+        }
+        for click in clicks.iter_mut().flatten() {
+            let slot = index[(click.u >> shift) as usize];
+            if slot != 0 {
+                groups[slot as usize - 1].2 += 1;
+            }
+            click.u = u64::from(slot);
+        }
+        let (mut eoff, mut coff) = (0, 0);
+        for (_, e, c) in &mut groups {
+            let (ne, nc) = (*e, *c);
+            *e = eoff;
+            *c = coff;
+            eoff += ne;
+            coff += nc;
+        }
+        let mut es = vec![0u64; n];
+        let mut cs = vec![Touch::default(); coff];
+        for event in events.into_iter().flatten() {
+            let at = &mut groups[event.person as usize].1;
+            es[*at] = u64::from(event.ts) << 32 | u64::from(event.purchase);
+            *at += 1;
+        }
+        for click in clicks.into_iter().flatten().filter(|c| c.u != 0) {
+            let at = &mut groups[click.u as usize - 1].2;
+            cs[*at] = Touch {
+                t: click.t,
+                id: click.id,
+                campaign: click.campaign,
+            };
+            *at += 1;
+        }
+        let (mut e, mut c) = (0, 0);
+        for (person, end_e, end_c) in groups {
+            let events = &mut es[e..end_e];
+            let clicks = &mut cs[c..end_c];
+            events.sort_unstable();
+            clicks.sort_unstable_by_key(|x| x.t);
+            self.person(keys, people.key(person), events, clicks);
+            e = end_e;
+            c = end_c;
+        }
+    }
+
     pub fn partition<E: Stored>(
         &mut self,
         keys: &Keys,

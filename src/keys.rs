@@ -361,6 +361,13 @@ impl Aliases {
                 .collect(),
         }
     }
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (Key, Key)> + '_ {
+        self.table.iter().filter_map(|(key, name)| {
+            let key = key.load(Relaxed);
+            (key != 0).then(|| (key, name.load(Relaxed)))
+        })
+    }
+
     #[inline]
     pub fn prefetch(&self, k: Key) {
         let i = k as usize & (self.table.len() - 1);

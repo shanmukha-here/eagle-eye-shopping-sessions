@@ -1,6 +1,7 @@
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod aggregate;
+mod compact;
 mod input;
 mod keys;
 mod output;
@@ -178,6 +179,23 @@ struct Candidate<T> {
     t: T,
 }
 
+trait EventSink<T: EventTime> {
+    fn push(&mut self, row: Candidate<T>, detail: Option<Detail>);
+}
+
+impl<T: EventTime> EventSink<T> for [Bucket<T>] {
+    #[inline(always)]
+    fn push(&mut self, mut row: Candidate<T>, detail: Option<Detail>) {
+        let bucket = row.id as usize & (self.len() - 1);
+        let bin = &mut self[bucket];
+        if let Some(detail) = detail {
+            row.arrival = SIDE | bin.extra.len() as u32;
+            bin.extra.push(detail);
+        }
+        bin.rows.push(row);
+    }
+}
+
 fn events<T: EventTime>(
     chunk: &[u8],
     dates: &mut Dates,
@@ -185,7 +203,7 @@ fn events<T: EventTime>(
     catalog: &Catalog,
     start: i64,
     end: i64,
-    partitions: &mut [Bucket<T>],
+    partitions: &mut (impl EventSink<T> + ?Sized),
 ) {
     rows::<7>(
         chunk,
@@ -228,23 +246,15 @@ fn events<T: EventTime>(
                     }
                 }
             }
-            let bucket = (id as usize) & (partitions.len() - 1);
-            let bin = &mut partitions[bucket];
             let arrival = ingest / 1000;
             let offset = arrival - start / 1000 + ARRIVAL_BIAS;
-            candidate.arrival = if cents == 0 && (offset as u64) < u64::from(SIDE) {
-                offset as u32
-            } else {
-                // Each side entry is 16 bytes. Its index fits within the 24 GiB cap.
-                let index = bin.extra.len() as u32;
-                bin.extra.push(Detail {
-                    arrival,
-                    cents,
-                    category,
-                });
-                SIDE | index
-            };
-            bin.rows.push(candidate);
+            candidate.arrival = offset as u32;
+            let detail = (cents != 0 || (offset as u64) >= u64::from(SIDE)).then_some(Detail {
+                arrival,
+                cents,
+                category,
+            });
+            partitions.push(candidate, detail);
         },
     );
 }
@@ -421,6 +431,12 @@ fn main() {
     fs::create_dir_all(out.join("campaign_daily")).unwrap();
     let keys = Keys::default();
     let catalog = Catalog::read(&data, &keys);
+    if end.saturating_sub(start) <= u32::MAX as i64
+        && catalog.categories.len() <= 256
+        && env::var_os("SHOPPING_COMPACT_RECORDS").is_some()
+    {
+        compact::pipeline(&data, &out, threads, start, end, keys, catalog, stage);
+    }
     if end.saturating_sub(start) <= u32::MAX as i64 {
         if catalog.categories.len() <= 256 {
             pipeline::<u32, SmallEvent>(&data, &out, threads, start, end, keys, catalog, stage);
@@ -503,12 +519,20 @@ fn pipeline<T: EventTime, E: Stored>(
                     let data = chunk.read(&mut s.2);
                     if fast {
                         let seen = raw::events(
-                            data, &mut s.0, &keys, &catalog, &clock, start, end, &mut s.1, level,
+                            data,
+                            &mut s.0,
+                            &keys,
+                            &catalog,
+                            &clock,
+                            start,
+                            end,
+                            &mut s.1[..],
+                            level,
                         );
                         s.4[0] += seen[0];
                         s.4[1] += seen[1];
                     } else {
-                        events(data, &mut s.0, &keys, &catalog, start, end, &mut s.1);
+                        events(data, &mut s.0, &keys, &catalog, start, end, &mut s.1[..]);
                     }
                 }
                 Scan::Clicks(chunk) => {
@@ -621,6 +645,15 @@ fn pipeline<T: EventTime, E: Stored>(
         },
     );
     stage("person sorts, aggregation and user parquet");
+    finish(out, &catalog, partial, stage)
+}
+
+fn finish(
+    out: &Path,
+    catalog: &Catalog,
+    partial: Vec<BTreeMap<i32, Vec<Stats>>>,
+    mut stage: impl FnMut(&str),
+) -> ! {
     let mut all = BTreeMap::new();
     for part in partial {
         for (day, stats) in part {

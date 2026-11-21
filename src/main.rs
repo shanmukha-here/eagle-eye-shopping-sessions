@@ -260,7 +260,7 @@ fn winners<T: EventTime, E: Stored>(
     }
     // First find unique hash positions in a cache-resident bitmap. Only IDs
     // at repeated positions require a full-key minimum-ingest reduction.
-    let bits = (count * 8).max(64).next_power_of_two();
+    let bits = (count * 16).max(64).next_power_of_two();
     let mut seen = vec![0u64; bits / 64];
     let mut collisions = vec![0u64; bits / 64];
     let index = |key: u64| (key >> 20) as usize & (bits - 1);

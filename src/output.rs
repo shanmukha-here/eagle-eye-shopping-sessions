@@ -33,60 +33,31 @@ fn column<T: DataType>(
     col.typed::<T>().write_batch(values, levels, None).unwrap();
     col.close().unwrap();
 }
-const USER: &str = "message user_daily {
-    REQUIRED BINARY user_id (UTF8); REQUIRED INT32 day (DATE);
-    REQUIRED INT64 sessions; REQUIRED INT64 events; REQUIRED INT64 revenue_cents;
-    OPTIONAL BINARY top_category (UTF8); }";
 const CAMPAIGN: &str = "message campaign_daily {
     REQUIRED BINARY campaign_id (UTF8); REQUIRED BINARY channel (UTF8); REQUIRED INT32 day (DATE);
     REQUIRED INT64 sessions; REQUIRED INT64 purchasing_sessions; REQUIRED INT64 revenue_cents;
     REQUIRED INT64 assisted_sessions; }";
 
 pub fn users(path: &Path, rows: &[UserRow], keys: &Keys, categories: &[ByteArray]) {
-    let mut f = file(path, USER);
-    for batch in rows.chunks(32768) {
-        let mut group = f.next_row_group().unwrap();
-        let mut packed = Vec::with_capacity(9 * batch.len());
-        let mut spans = Vec::with_capacity(batch.len());
-        let mut days = Vec::with_capacity(batch.len());
-        let mut sessions = Vec::with_capacity(batch.len());
-        let mut events = Vec::with_capacity(batch.len());
-        let mut revenue = Vec::with_capacity(batch.len());
-        let mut levels = Vec::with_capacity(batch.len());
-        let mut cats = Vec::with_capacity(batch.len());
-        let mut previous = None;
-        let mut span = (0, 0);
-        for row in batch {
-            if previous != Some(row.u) {
-                let start = packed.len();
-                keys.append_bytes(row.u, &mut packed);
-                span = (start, packed.len() - start);
-                previous = Some(row.u);
-            }
-            spans.push(span);
-            days.push(row.day);
-            sessions.push(row.sessions);
-            events.push(row.events);
-            revenue.push(row.revenue);
-            levels.push(i16::from(row.top.is_some()));
-            if let Some(c) = row.top {
-                cats.push(categories[c as usize].clone());
-            }
+    let mut out = crate::pages::Output::users(path);
+    let mut name = Vec::new();
+    let mut previous = None;
+    for row in rows {
+        if previous != Some(row.u) {
+            name.clear();
+            keys.append_bytes(row.u, &mut name);
+            previous = Some(row.u);
         }
-        let bytes = ByteArray::from(packed);
-        let names: Vec<_> = spans
-            .into_iter()
-            .map(|(off, n)| bytes.slice(off, n))
-            .collect();
-        column::<ByteArrayType>(&mut group, &names, None);
-        column::<Int32Type>(&mut group, &days, None);
-        column::<Int64Type>(&mut group, &sessions, None);
-        column::<Int64Type>(&mut group, &events, None);
-        column::<Int64Type>(&mut group, &revenue, None);
-        column::<ByteArrayType>(&mut group, &cats, Some(&levels));
-        group.close().unwrap();
+        out.user(
+            &name,
+            row.day,
+            row.sessions,
+            row.events,
+            row.revenue,
+            row.top.map(|category| categories[category as usize].data()),
+        );
     }
-    f.close().unwrap();
+    out.close();
 }
 pub fn campaigns(path: &Path, days: BTreeMap<i32, Vec<Stats>>, catalog: &[(ByteArray, ByteArray)]) {
     let mut f = file(path, CAMPAIGN);

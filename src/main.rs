@@ -4,6 +4,7 @@ mod aggregate;
 mod input;
 mod keys;
 mod output;
+mod pages;
 
 use aggregate::{Click, Event, SmallEvent, Stats, Stored, Totals};
 use input::{DAY, Dates, INVALID, Input, WEEK, jobs, rows};

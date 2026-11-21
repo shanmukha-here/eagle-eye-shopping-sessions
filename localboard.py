@@ -224,7 +224,8 @@ def dataset(name, limit, allow_cutoff=False):
 def predict(times):
     # Rows: median container lifecycle (or native process time), CPU seconds, board seconds.
     points = json.loads(calibration.read_text()) if calibration.exists() else (
-        [[2.5874, 8.59367, 2.06], [2.3138, 6.65119, 1.6], [1.3575, 6.44747, 1.5]] if image else [[4.8245, 12.37469, 2.06], [4.4715, 9.55942, 1.6], [4.0621, 7.6297, 1.5]])
+        [[2.5874, 8.59367, 2.06], [2.3138, 6.65119, 1.6], [1.3575, 6.44747, 1.5], [1.189, 5.21428, 1.01]] if image else
+        [[4.8245, 12.37469, 2.06], [4.4715, 9.55942, 1.6], [4.0621, 7.6297, 1.5], [3.9095, 6.40911, 1.01]])
     mae, _, name, _, parameters = select_model(points)[0]
     wall = statistics.median(t[1] for t in times)
     cpu = statistics.median(t[2] for t in times)

@@ -112,25 +112,147 @@ pub(crate) struct Event {
     pub purchase: u32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
+#[repr(C)]
 struct Payload {
     person: u32,
     ts: u32,
     arrival: u32,
 }
 
+// Sixteen records give two whole key cache lines and three payload
+// cache lines. The key pass does not read the payload lines.
+#[derive(Clone, Copy, Default)]
+#[repr(C, align(64))]
+struct Frame {
+    ids: [Key; 16],
+    rows: [Payload; 16],
+}
+
+struct Frames {
+    output: Vec<Frame>,
+    pending: Frame,
+    count: usize,
+    stream: bool,
+}
+
+impl Frames {
+    fn push(&mut self, id: Key, row: Payload) {
+        self.pending.ids[self.count] = id;
+        self.pending.rows[self.count] = row;
+        self.count += 1;
+        if self.count == 16 {
+            if self.stream {
+                let dest = self.output.spare_capacity_mut();
+                if dest.is_empty() {
+                    self.fence();
+                    self.output.reserve(1);
+                }
+                let n = self.output.len();
+                // A Frame is exactly five aligned cache lines. Only these
+                // slots are subsequently exposed as initialized.
+                unsafe {
+                    stream_frame(self.output.as_mut_ptr().add(n), &self.pending);
+                    self.output.set_len(n + 1);
+                }
+            } else {
+                self.output.push(self.pending);
+            }
+            self.count = 0;
+        }
+    }
+
+    fn fence(&self) {
+        if self.stream {
+            unsafe { std::arch::x86_64::_mm_sfence() };
+        }
+    }
+}
+
+#[target_feature(enable = "avx2")]
+unsafe fn stream_frame(out: *mut Frame, from: &Frame) {
+    use std::arch::x86_64::*;
+    let src = (from as *const Frame).cast::<__m256i>();
+    let dst = out.cast::<__m256i>();
+    // Frame has 320 initialized bytes and both pointers are 64-byte aligned.
+    for i in 0..10 {
+        unsafe { _mm256_stream_si256(dst.add(i), _mm256_load_si256(src.add(i))) };
+    }
+}
+
 struct Part {
     ids: Vec<Key>,
     rows: Vec<Payload>,
     extra: Vec<Detail>,
+    frames: Option<Box<Frames>>,
 }
 impl Part {
-    fn new(cap: usize) -> Self {
+    fn new(cap: usize, combine: usize, fast: bool) -> Self {
+        let direct = if combine == 0 { cap } else { 0 };
+        let frames = (combine != 0).then(|| {
+            Box::new(Frames {
+                output: Vec::with_capacity(cap.div_ceil(16)),
+                pending: Frame::default(),
+                count: 0,
+                stream: combine == 2 && fast,
+            })
+        });
         Self {
-            ids: Vec::with_capacity(cap),
-            rows: Vec::with_capacity(cap),
+            ids: Vec::with_capacity(direct),
+            rows: Vec::with_capacity(direct),
             extra: Vec::new(),
+            frames,
         }
+    }
+
+    #[inline(always)]
+    fn push(&mut self, id: Key, row: Payload) {
+        if let Some(frames) = &mut self.frames {
+            frames.push(id, row);
+        } else {
+            self.ids.push(id);
+            self.rows.push(row);
+        }
+    }
+
+    fn len(&self) -> usize {
+        if let Some(frames) = &self.frames {
+            frames.output.len() * 16 + frames.count
+        } else {
+            self.ids.len()
+        }
+    }
+
+    fn keys_and_rows(&self) -> impl Iterator<Item = (Key, Payload)> + '_ {
+        self.ids
+            .iter()
+            .copied()
+            .zip(self.rows.iter().copied())
+            .chain(self.frames.iter().flat_map(|frames| {
+                frames
+                    .output
+                    .iter()
+                    .flat_map(|f| f.ids.iter().copied().zip(f.rows.iter().copied()))
+                    .chain(
+                        frames.pending.ids[..frames.count]
+                            .iter()
+                            .copied()
+                            .zip(frames.pending.rows[..frames.count].iter().copied()),
+                    )
+            }))
+    }
+
+    fn ids(&self) -> impl Iterator<Item = Key> + '_ {
+        self.ids
+            .iter()
+            .copied()
+            .chain(self.frames.iter().flat_map(|frames| {
+                frames
+                    .output
+                    .iter()
+                    .flat_map(|f| f.ids.iter().copied())
+                    .chain(frames.pending.ids[..frames.count].iter().copied())
+            }))
     }
 }
 
@@ -156,12 +278,14 @@ impl EventSink<u32> for Emitter<'_> {
         } else {
             self.people.person(row.user, self.aliases)
         };
-        part.ids.push(row.id);
-        part.rows.push(Payload {
-            person,
-            ts: row.t,
-            arrival,
-        });
+        part.push(
+            row.id,
+            Payload {
+                person,
+                ts: row.t,
+                arrival,
+            },
+        );
     }
 }
 
@@ -194,13 +318,13 @@ fn send(row: Payload, part: &Part, out: &mut [Vec<Event>]) {
 }
 
 fn reduce(parts: Vec<Part>, out: &mut [Vec<Event>], origin: i64, bits_per_row: usize) {
-    let n = parts.iter().map(|p| p.ids.len()).sum::<usize>();
+    let n = parts.iter().map(|p| p.len()).sum::<usize>();
     let bits = (n * bits_per_row).max(64).next_power_of_two();
     let mut seen = vec![0u64; bits / 64];
     let mut repeated = vec![0u64; bits / 64];
     let index = |id: Key| (id >> 20) as usize & (bits - 1);
     for part in &parts {
-        for &id in &part.ids {
+        for id in part.ids() {
             let bit = index(id);
             let mask = 1 << (bit % 64);
             repeated[bit / 64] |= seen[bit / 64] & mask;
@@ -211,7 +335,7 @@ fn reduce(parts: Vec<Part>, out: &mut [Vec<Event>], origin: i64, bits_per_row: u
     let mut copies = IntMap::<(usize, Payload, i64)>::default();
     copies.reserve(n / 8);
     for (which, part) in parts.iter().enumerate() {
-        for (&key, &row) in part.ids.iter().zip(&part.rows) {
+        for (key, row) in part.keys_and_rows() {
             let bit = index(key);
             if repeated[bit / 64] & (1 << (bit % 64)) == 0 {
                 send(row, part, out);
@@ -262,6 +386,7 @@ pub(crate) fn pipeline(
         .clamp(1, 512)
         .next_power_of_two();
     let divisor = setting("SHOPPING_DENSE_DIVISOR", 768).clamp(16, 4096);
+    let combine = setting("SHOPPING_SW_COMBINE", 0).min(2);
     let bits = setting("SHOPPING_DEDUP_BITS", 16).clamp(2, 64);
     let clock = raw::Calendar::new(start, end);
     let fast = raw::available();
@@ -287,13 +412,15 @@ pub(crate) fn pipeline(
             });
         }
         let cap = input.bytes() / 72 / partitions / threads;
-        jobs(
+        input::jobs_finish(
             tasks,
             threads,
             |_| {
                 (
                     Emitter {
-                        bins: (0..partitions).map(|_| Part::new(cap)).collect(),
+                        bins: (0..partitions)
+                            .map(|_| Part::new(cap, combine, fast))
+                            .collect(),
                         people: &people,
                         aliases: &aliases,
                     },
@@ -330,6 +457,12 @@ pub(crate) fn pipeline(
                         clicks[person as usize & (shards - 1)].push(click);
                     }
                 }
+            },
+            |_, lane| {
+                if let Some(frame) = lane.0.bins.first().and_then(|part| part.frames.as_ref()) {
+                    frame.fence();
+                }
+                lane
             },
         )
     });

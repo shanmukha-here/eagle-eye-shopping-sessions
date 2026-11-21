@@ -140,7 +140,13 @@ unsafe fn two_ids<const FIRST: bool, const SECOND: bool>(
 unsafe fn suffix(field: Ptr, width: usize, quotes: usize, delimiter: u8) -> Ptr {
     unsafe {
         let at = field.add(width);
-        if (quotes == 0 || at.read() == b'"') && at.add(quotes).read() == delimiter {
+        // Both bytes are readable at every use on the guarded raw path.
+        let found = at.cast::<u16>().read_unaligned();
+        let mask = 0xffu16 | ((quotes as u16).wrapping_neg() << 8);
+        let plain = u16::from(delimiter);
+        let quoted = (plain << 8) | u16::from(b'"');
+        let expected = if quotes == 0 { plain } else { quoted };
+        if (found ^ expected) & mask == 0 {
             at.add(quotes + 1)
         } else {
             std::ptr::null()
@@ -152,18 +158,19 @@ unsafe fn suffix(field: Ptr, width: usize, quotes: usize, delimiter: u8) -> Ptr 
 unsafe fn hms<const CHECK: bool>(p: Ptr) -> i64 {
     unsafe {
         let x = word(p.add(11)) ^ u64::from_le_bytes(*b"00:00:00");
-        if CHECK
-            && (x & !0x0f0f000f0f000f0f != 0
-                || x.wrapping_add(0x0606000606000606) & 0x1010001010001010 != 0)
-        {
-            return INVALID;
-        }
+        let valid_digits = (x & !0x0f0f000f0f000f0f
+            | x.wrapping_add(0x0606000606000606) & 0x1010001010001010)
+            == 0;
         let pairs = x.wrapping_mul(10).wrapping_add(x >> 8) & 0xff0000ff0000ff;
-        if CHECK && pairs.wrapping_add((68u64 << 48) | (68u64 << 24) | 104) & 0x80000080000080 != 0
-        {
-            return INVALID;
+        let valid_ranges =
+            pairs.wrapping_add((68u64 << 48) | (68u64 << 24) | 104) & 0x80000080000080 == 0;
+        let time =
+            ((pairs & 255) * 3600 + ((pairs >> 24) & 255) * 60 + (pairs >> 48)) as i64 * 1000;
+        if CHECK && !(valid_digits & valid_ranges) {
+            INVALID
+        } else {
+            time
         }
-        ((pairs & 255) * 3600 + ((pairs >> 24) & 255) * 60 + (pairs >> 48)) as i64 * 1000
     }
 }
 
@@ -194,7 +201,7 @@ unsafe fn stamp<const WIDTH: usize>(p: Ptr, calendar: &Calendar) -> i64 {
         }
         let day = calendar.day(p);
         let time = hms::<true>(p);
-        if day == INVALID || time == INVALID || p.add(10).read() != b'T' {
+        if (day == INVALID) | (time == INVALID) | (p.add(10).read() != b'T') {
             return INVALID;
         }
         if WIDTH == 20 {
@@ -270,21 +277,19 @@ unsafe fn view_tail(p: Ptr, end: Ptr) -> bool {
         let data = _mm256_loadu_si256(product.cast());
         let sep =
             (_mm256_movemask_epi8(_mm256_cmpeq_epi8(data, _mm256_set1_epi8(44))) as u32) & mask;
-        if sep == 0 || sep & (sep - 1) != 0 {
-            return false;
-        }
         let qmask =
             (_mm256_movemask_epi8(_mm256_cmpeq_epi8(data, _mm256_set1_epi8(34))) as u32) & mask;
         let cut = sep.trailing_zeros();
-        if cut == 0 {
-            return false;
-        }
-        let qp = qmask & (sep - 1);
-        if qp != 0 && (cut < 3 || qp != 1 | (1 << (cut - 1))) {
-            return false;
-        }
-        let qa = qmask & !((sep - 1) | sep);
-        qa == 0 || (n > cut + 2 && qa == (sep << 1) | (1 << (n - 1)))
+        let before_sep = sep.wrapping_sub(1);
+        let qp = qmask & before_sep;
+        let qa = qmask & !before_sep & !sep;
+        let product_quotes = (cut >= 3) & (qp == (1 | 1u32.wrapping_shl(cut.wrapping_sub(1))));
+        let price_quotes =
+            (n > cut + 2) & (qa == ((sep << 1) | 1u32.wrapping_shl(n.wrapping_sub(1))));
+        (sep.count_ones() == 1)
+            & (cut != 0)
+            & ((qp == 0) | product_quotes)
+            & ((qa == 0) | price_quotes)
     }
 }
 
@@ -315,11 +320,12 @@ unsafe fn decode_event<const LEVEL: usize, T: EventTime>(
             return true;
         }
         let day = state.clock.day(received);
-        if day == INVALID || received.add(10).read() != b'T' || received.add(19).read() != b'Z' {
-            return false;
-        }
         let receive_ms = hms::<true>(received);
-        if receive_ms == INVALID {
+        if (day == INVALID)
+            | (receive_ms == INVALID)
+            | (received.add(10).read() != b'T')
+            | (received.add(19).read() != b'Z')
+        {
             return false;
         }
         let arrival = day + receive_ms;

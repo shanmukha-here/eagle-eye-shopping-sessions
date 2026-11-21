@@ -27,4 +27,4 @@ On a Docker host set `BOARD_IMAGE` to a local image tag and `BOARD_CPUS` to eigh
 
 Use `--public` for fixtures and dev, `--trial` for a three-run practice experiment, and `--tune` for practice and final development checks. These modes preserve the reserved release holdout.
 
-For a warm-cache forecast, set `BOARD_WARM_MODEL` to the calibration JSON for the timing host and CPU pin. It contains `slope`, `median_ratio`, and `loo_mae_s`. The simulator verifies input residency before each practice and final run and reports both calibrated estimates. `--trial` runs the three exact practice repeats.
+For a warm-cache forecast, set `BOARD_WARM_MODEL` to the calibration JSON for the timing host and CPU pin. It contains `slope`, `median_ratio`, and `loo_mae_s`. Add `cpu_slope` and `cpu_loo_mae_s` to also report a forecast based on the workload CPU charge. The simulator verifies input residency before each practice and final run and reports both calibrated estimates. `--trial` runs the three exact practice repeats.

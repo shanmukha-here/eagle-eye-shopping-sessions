@@ -31,9 +31,12 @@ calibration = data / ("docker-cpu-calibration.json" if image else "native-cpu-ca
 warm_model_path = os.environ.get("BOARD_WARM_MODEL")
 warm_model = json.loads(Path(warm_model_path).read_text()) if warm_model_path else None
 if warm_model is not None:
-    for name in ("slope", "median_ratio", "loo_mae_s"):
+    fields = ("slope", "median_ratio", "loo_mae_s")
+    if "cpu_slope" in warm_model:
+        fields += ("cpu_slope", "cpu_loo_mae_s")
+    for name in fields:
         value = warm_model[name]
-        if not math.isfinite(value) or value < 0 or (name != "loo_mae_s" and value == 0):
+        if not math.isfinite(value) or value < 0 or (not name.endswith("mae_s") and value == 0):
             sys.exit(f"invalid warm model {name}")
 
 calibrate = sys.argv[1:] == ["--calibrate"]
@@ -287,9 +290,14 @@ def dataset(name, limit, allow_cutoff=False):
 def predict(times):
     if warm_model is not None:
         wall = statistics.median(t[1] for t in times)
-        return (f"model='warm wall' loo_mae_s={warm_model['loo_mae_s']:.4f} "
-                f"ratio_estimate_s={warm_model['median_ratio']*wall:.4f} "
-                f"predicted_board_s={warm_model['slope']*wall:.4f}")
+        prediction = (f"model='warm wall' loo_mae_s={warm_model['loo_mae_s']:.4f} "
+                      f"ratio_estimate_s={warm_model['median_ratio']*wall:.4f} "
+                      f"predicted_board_s={warm_model['slope']*wall:.4f}")
+        if "cpu_slope" in warm_model:
+            cpu = statistics.median(t[2] for t in times)
+            prediction += (f" warm_cpu_s={cpu:.4f} cpu_loo_mae_s={warm_model['cpu_loo_mae_s']:.4f}"
+                           f" cpu_predicted_board_s={warm_model['cpu_slope']*cpu:.4f}")
+        return prediction
     # Rows: median container lifecycle (or native process time), CPU seconds, board seconds.
     points = json.loads(calibration.read_text()) if calibration.exists() else (
         [[2.5874, 8.59367, 2.06], [2.3138, 6.65119, 1.6], [1.3575, 6.44747, 1.5], [1.189, 5.21428, 1.01], [1.0594, 5.45611, 1.03]] if image else

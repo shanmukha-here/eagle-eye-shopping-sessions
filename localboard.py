@@ -4,6 +4,7 @@ import fcntl
 import resource
 import ctypes
 import mmap
+import math
 import uuid
 import select
 import shutil
@@ -27,6 +28,14 @@ if image:
         sys.exit("invalid image platform or size")
 # Fit separate cold measurements on each host. Never apply a warm fit to cold data.
 calibration = data / ("docker-cpu-calibration.json" if image else "native-cpu-calibration.json")
+warm_model_path = os.environ.get("BOARD_WARM_MODEL")
+warm_model = json.loads(Path(warm_model_path).read_text()) if warm_model_path else None
+if warm_model is not None:
+    for name in ("slope", "median_ratio", "loo_mae_s"):
+        value = warm_model[name]
+        if not math.isfinite(value) or value < 0 or (name != "loo_mae_s" and value == 0):
+            sys.exit(f"invalid warm model {name}")
+
 calibrate = sys.argv[1:] == ["--calibrate"]
 quick = sys.argv[1:] == ["--trial"]
 tuning = sys.argv[1:] == ["--tune"]
@@ -103,6 +112,38 @@ def evict(inp):
 PAGE_BITS = bytes(i & 1 for i in range(256))
 
 
+def warm(inp):
+    """Ensure at least 99.99% of the timed corpus is in the file cache."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    page_size = mmap.PAGESIZE
+    files = [path for path in sorted(inp.rglob("*")) if path.is_file() and path.stat().st_size]
+    pages = sum((path.stat().st_size + page_size - 1) // page_size for path in files)
+
+    def count_resident():
+        resident = 0
+        for path in files:
+            with path.open("rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_COPY) as region:
+                count = (len(region) + page_size - 1) // page_size
+                flags = (ctypes.c_ubyte * count)()
+                address = ctypes.addressof(ctypes.c_char.from_buffer(region))
+                if libc.mincore(ctypes.c_void_p(address), ctypes.c_size_t(len(region)), flags):
+                    raise OSError(ctypes.get_errno(), "mincore")
+                resident += bytes(flags).translate(PAGE_BITS).count(1)
+        return resident
+
+    resident = count_resident()
+    if resident < pages * .9999:
+        buffer = bytearray(4 << 20)
+        for path in files:
+            with path.open("rb", buffering=0) as f:
+                while f.readinto(buffer):
+                    pass
+        resident = count_resident()
+        if resident < pages * .9999:
+            raise RuntimeError(f"warm input cache {resident}/{pages} pages")
+    return resident, pages
+
+
 def disk_bytes(out, scratch):
     total = 0
     for root in (out, scratch):
@@ -152,6 +193,21 @@ def container_time(state):
     return (end - timestamp("StartedAt")).total_seconds()
 
 
+def open_pidfd(pid):
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid)
+    # The native simulator targets Linux/amd64. Some Python builds omit
+    # pidfd_open even when the host kernel supports the Linux syscall.
+    if os.uname().machine != "x86_64":
+        raise RuntimeError("the native simulator needs pidfd_open")
+    libc = ctypes.CDLL(None, use_errno=True)
+    syscall_number = 434  # __NR_pidfd_open on Linux/x86-64
+    fd = libc.syscall(ctypes.c_long(syscall_number), ctypes.c_int(pid), ctypes.c_uint(0))
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), "pidfd_open")
+    return fd
+
+
 def run(name, inp, answer, limit, allow_cutoff=False):
     with tempfile.TemporaryDirectory(dir=data / "scratch") as tmp:
         base = Path(tmp)
@@ -161,13 +217,19 @@ def run(name, inp, answer, limit, allow_cutoff=False):
         execution = dict(env, DATA_DIR=str(inp), OUTPUT_DIR=str(out),
                          SCRATCH_DIR=str(scratch), HOME=str(scratch), TMPDIR=str(scratch))
         with command(inp, out, scratch) as (argv, container), (base / "stdout").open("wb") as stdout, (base / "stderr").open("wb") as stderr:
-            pages = evict(inp)
+            if warm_model is not None and name in ("practice", "final"):
+                resident, pages = warm(inp)
+                cache = f"warm={resident}/{pages} pages"
+            else:
+                pages = evict(inp)
+                cache = f"cold=0/{pages} pages"
             cpu_start = cpu_seconds()
             start = time.perf_counter()
             proc = subprocess.Popen(argv, env=execution, cwd=scratch,
                                     stdout=stdout, stderr=stderr, start_new_session=True)
-            fd = os.pidfd_open(proc.pid)
+            fd = None
             try:
+                fd = open_pidfd(proc.pid)
                 while True:
                     remaining = start + limit - time.perf_counter()
                     if remaining <= 0 and container:
@@ -189,7 +251,8 @@ def run(name, inp, answer, limit, allow_cutoff=False):
                     if disk_bytes(out, scratch) > 50_000_000_000 or stdout.tell() > 50_000_000:
                         raise RuntimeError(f"{name} disk or stdout limit")
             finally:
-                os.close(fd)
+                if fd is not None:
+                    os.close(fd)
                 if proc.poll() is None:
                     os.killpg(proc.pid, signal.SIGKILL)
                     proc.wait()
@@ -213,7 +276,7 @@ def run(name, inp, answer, limit, allow_cutoff=False):
         if name in ("practice", "final"):
             stages = (base / "stderr").read_text().strip().replace("\n", ", ")
             clock = f" lifecycle_s={lifecycle:.4f}" if container else ""
-            print(f"{name} {elapsed:.4f}s exact cold=0/{pages} pages{clock} cpu_s={used_cpu:.5f} | {stages}", flush=True)
+            print(f"{name} {elapsed:.4f}s exact {cache}{clock} cpu_s={used_cpu:.5f} | {stages}", flush=True)
         return elapsed, lifecycle, used_cpu
 
 
@@ -222,6 +285,11 @@ def dataset(name, limit, allow_cutoff=False):
 
 
 def predict(times):
+    if warm_model is not None:
+        wall = statistics.median(t[1] for t in times)
+        return (f"model='warm wall' loo_mae_s={warm_model['loo_mae_s']:.4f} "
+                f"ratio_estimate_s={warm_model['median_ratio']*wall:.4f} "
+                f"predicted_board_s={warm_model['slope']*wall:.4f}")
     # Rows: median container lifecycle (or native process time), CPU seconds, board seconds.
     points = json.loads(calibration.read_text()) if calibration.exists() else (
         [[2.5874, 8.59367, 2.06], [2.3138, 6.65119, 1.6], [1.3575, 6.44747, 1.5], [1.189, 5.21428, 1.01], [1.0594, 5.45611, 1.03]] if image else
@@ -239,7 +307,8 @@ if calibrate or quick:
     reps = 5 if calibrate else 3
     times = [dataset("practice", 300) for _ in range(reps)]
     measured = statistics.median(t[0] for t in times)
-    print(f"cold_20M_median{reps}_s={measured:.4f}", flush=True)
+    condition = "warm" if warm_model is not None else "cold"
+    print(f"{condition}_20M_median{reps}_s={measured:.4f}", flush=True)
     if quick:
         print(predict(times), flush=True)
     sys.exit(0)

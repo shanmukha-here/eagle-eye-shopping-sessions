@@ -5,7 +5,7 @@ mod output;
 
 use aggregate::{Click, Event, Stats, Totals};
 use input::{DAY, Dates, INVALID, Input, WEEK, jobs, rows};
-use keys::{IntMap, Key, Keys, People, mix};
+use keys::{Aliases, IntMap, Key, Keys, People, mix};
 use parquet::data_type::ByteArray;
 use std::{
     collections::BTreeMap,
@@ -96,7 +96,7 @@ fn events(
             return;
         }
         let id = keys.key(f[0]);
-        let ingest = dates.stamp(f[3]).expect("invalid ingest time");
+        let ingest = dates.ingest(f[3]);
         let mut candidate = Candidate {
             id,
             user: 0,
@@ -137,37 +137,24 @@ fn events(
     });
 }
 
-fn winners(parts: Vec<Vec<Candidate>>, people: &People, out: &mut [Vec<Event>]) {
+fn winners(parts: Vec<Vec<Candidate>>, people: &Aliases, out: &mut [Vec<Event>]) {
     let count = parts.iter().map(Vec::len).sum::<usize>();
     if count == 0 {
         return;
     }
-    let capacity = (count + count / 2 + 1).next_power_of_two();
-    let mut slots = vec![0u32; capacity];
-    let mut records: Vec<Candidate> = Vec::with_capacity(count);
-    for copies in parts {
-        for copy in copies {
-            // Use different hash bits from the partition selector.
-            let mut slot = (mix(copy.id) >> 20) as usize & (capacity - 1);
-            loop {
-                let pos = slots[slot];
-                if pos == 0 {
-                    records.push(copy);
-                    slots[slot] = records.len() as u32;
-                    break;
-                }
-                let winner = &mut records[pos as usize - 1];
-                if winner.id == copy.id {
-                    if copy.ingest < winner.ingest {
-                        *winner = copy;
-                    }
-                    break;
-                }
-                slot = (slot + 1) & (capacity - 1);
-            }
-        }
+    // First find unique hash positions in a cache-resident bitmap. Only IDs
+    // at repeated positions require a full-key minimum-ingest reduction.
+    let bits = (count * 8).max(64).next_power_of_two();
+    let mut seen = vec![0u64; bits / 64];
+    let mut collisions = vec![0u64; bits / 64];
+    let index = |key| (mix(key) >> 20) as usize & (bits - 1);
+    for e in parts.iter().flatten() {
+        let i = index(e.id);
+        let mask = 1u64 << (i % 64);
+        collisions[i / 64] |= seen[i / 64] & mask;
+        seen[i / 64] |= mask;
     }
-    for e in records {
+    let mut emit = |e: Candidate| {
         if e.t != INVALID {
             let u = people.canonical(e.user);
             let shard = mix(u) as usize & (out.len() - 1);
@@ -178,6 +165,33 @@ fn winners(parts: Vec<Vec<Candidate>>, people: &People, out: &mut [Vec<Event>]) 
                 cat: e.cat,
             });
         }
+    };
+    let mut repeated = IntMap::<Candidate>::default();
+    repeated.reserve(count / 8);
+    for copies in parts {
+        for block in copies.chunks(32) {
+            for e in block {
+                people.prefetch(e.user);
+            }
+            for &e in block {
+                let i = index(e.id);
+                if collisions[i / 64] & (1u64 << (i % 64)) == 0 {
+                    emit(e);
+                } else {
+                    repeated
+                        .entry(e.id)
+                        .and_modify(|old| {
+                            if e.ingest < old.ingest {
+                                *old = e
+                            }
+                        })
+                        .or_insert(e);
+                }
+            }
+        }
+    }
+    for e in repeated.into_values() {
+        emit(e);
     }
 }
 
@@ -207,44 +221,50 @@ fn main() {
     fs::create_dir_all(out.join("campaign_daily")).unwrap();
     let keys = Keys::default();
     let catalog = Catalog::read(&data, &keys);
-    let links = Input::open(&data.join("links"));
-    let edges = jobs(
-        links.chunks(),
-        threads,
-        |_| Vec::new(),
-        |local, chunk| {
-            rows::<2>(chunk, |f| {
-                if !f[0].is_empty() && !f[1].is_empty() {
-                    local.push((keys.key(f[0]), keys.key(f[1])));
-                }
-            });
-        },
-    );
-    let mut people = People::default();
-    for lane in edges {
-        for (a, b) in lane {
-            people.join(&keys, a, b);
-        }
-    }
-    people.freeze();
-    drop(links);
-    stage("catalogs and links");
-
     let raw = Input::open(&data.join("events"));
-    let n = ((raw.bytes() / (2 << 20)).max(1))
+    let n = ((raw.bytes() / (6 << 20)).max(1))
         .next_power_of_two()
         .min(4096);
+    let people = std::sync::OnceLock::new();
+    let mut tasks = vec![None];
+    tasks.extend(raw.chunks().into_iter().map(Some));
     let lanes = jobs(
-        raw.chunks(),
+        tasks,
         threads,
-        |_| (Dates::new(), columns(n)),
-        |s, chunk| {
-            events(chunk, &mut s.0, &keys, &catalog, start, end, &mut s.1);
+        |_| {
+            let expected = raw.bytes() / 64 / threads / n;
+            (
+                Dates::new(),
+                (0..n)
+                    .map(|_| Vec::with_capacity(expected))
+                    .collect::<Vec<_>>(),
+            )
+        },
+        |s, task| {
+            if let Some(chunk) = task {
+                events(chunk, &mut s.0, &keys, &catalog, start, end, &mut s.1);
+            } else {
+                people.get_or_init(|| {
+                    let links = Input::open(&data.join("links"));
+                    let mut people = People::default();
+                    people.reserve(links.bytes() / 22);
+                    for chunk in links.chunks() {
+                        rows::<2>(chunk, |f| {
+                            if !f[0].is_empty() && !f[1].is_empty() {
+                                people.join(&keys, keys.key(f[0]), keys.key(f[1]));
+                            }
+                        });
+                    }
+                    drop(links);
+                    people.freeze()
+                });
+            }
         },
     );
+    let people = people.into_inner().unwrap();
     let parts = transpose(lanes.into_iter().map(|s| s.1).collect(), n);
     drop(raw);
-    stage("event parse");
+    stage("event parse and identity graph");
     let person_shards = n.min(512);
     let grouped = jobs(
         parts,
@@ -296,11 +316,7 @@ fn main() {
         threads,
         |_| Totals::new(catalog.categories.len(), catalog.channels.len()),
         |local, (es, cs)| {
-            local.partition(
-                &keys,
-                es.into_iter().flatten().collect(),
-                cs.into_iter().flatten().collect(),
-            );
+            local.partition(&keys, es, cs);
         },
     );
     stage("person sorts and aggregation");

@@ -1,7 +1,6 @@
 //! Reversible, order-preserving packing for common short ASCII identifiers.
 //! All other byte strings use exact interning, including strings containing NUL.
 use std::{
-    arch::x86_64::*,
     cmp::Ordering,
     collections::HashMap,
     hash::{BuildHasherDefault, Hasher},
@@ -10,6 +9,22 @@ use std::{
 pub type Key = u64;
 const EXTERNAL: u64 = 1 << 63;
 const LOW: u64 = 0x7f7f7f7f7f7f7f7f;
+
+// The ninth byte occupies the unused high bits of the last seven ASCII bytes.
+const fn ninth_table() -> [u64; 128] {
+    let mut out = [0; 128];
+    let mut i = 0;
+    while i < 128 {
+        let mut b = 0;
+        while b < 7 {
+            out[i] |= (((i >> b) & 1) as u64) << (7 + b * 8);
+            b += 1;
+        }
+        i += 1;
+    }
+    out
+}
+const NINTH: [u64; 128] = ninth_table();
 
 #[inline]
 pub fn mix(mut k: u64) -> u64 {
@@ -46,16 +61,23 @@ pub struct Keys(Mutex<Long>);
 impl Keys {
     #[inline]
     pub fn key(&self, s: &[u8]) -> Key {
-        if s.len() <= 9 {
-            let mut bytes = [0u8; 8];
-            let len = s.len().min(8);
-            bytes[..len].copy_from_slice(&s[..len]);
-            let v = u64::from_be_bytes(bytes);
+        if (8..=9).contains(&s.len()) {
+            let word = u64::from_be_bytes(s[..8].try_into().unwrap());
             let last = s.get(8).copied().unwrap_or(0);
-            if v & !LOW == 0 && last < 128 && !s.contains(&0) {
-                return (unsafe { _pext_u64(v, LOW) } << 7) | last as u64;
+            let zero = word.wrapping_sub(0x0101010101010101) & !word & !LOW;
+            if word & !LOW == 0 && zero == 0 && last < 128 && (last != 0 || s.len() == 8) {
+                return word | NINTH[last as usize];
             }
+        } else if s.len() < 8 && s.iter().all(|&b| b > 0 && b < 128) {
+            let mut bytes = [0; 8];
+            bytes[..s.len()].copy_from_slice(s);
+            return u64::from_be_bytes(bytes);
         }
+        self.intern(s)
+    }
+    #[cold]
+    #[inline(never)]
+    fn intern(&self, s: &[u8]) -> Key {
         let mut pool = self.0.lock().unwrap();
         if let Some(id) = pool.ids.get(s) {
             return *id;
@@ -69,9 +91,13 @@ impl Keys {
         if k & EXTERNAL != 0 {
             return self.0.lock().unwrap().strings[(k ^ EXTERNAL) as usize].clone();
         }
-        let first = unsafe { _pdep_u64(k >> 7, LOW) }.to_be_bytes();
-        let mut out = first.to_vec();
-        out.push((k & 127) as u8);
+        let mut out = Vec::with_capacity(9);
+        out.extend_from_slice(&(k & LOW).to_be_bytes());
+        let mut last = 0;
+        for i in 0..7 {
+            last |= (((k >> (7 + 8 * i)) & 1) as u8) << i;
+        }
+        out.push(last);
         while out.last() == Some(&0) {
             out.pop();
         }
@@ -80,7 +106,9 @@ impl Keys {
     #[inline]
     pub fn cmp(&self, a: Key, b: Key) -> Ordering {
         if (a | b) & EXTERNAL == 0 {
-            a.cmp(&b)
+            (a & LOW)
+                .cmp(&(b & LOW))
+                .then_with(|| (a & !LOW).cmp(&(b & !LOW)))
         } else {
             self.bytes(a).cmp(&self.bytes(b))
         }
@@ -95,6 +123,12 @@ pub struct People {
     names: Vec<Key>,
 }
 impl People {
+    pub fn reserve(&mut self, edges: usize) {
+        self.index.reserve(edges + edges / 2);
+        self.parents.reserve(edges);
+        self.names.reserve(edges);
+        self.size.reserve(edges);
+    }
     fn node(&mut self, k: Key) -> u32 {
         let n = self.parents.len() as u32;
         *self.index.entry(k).or_insert_with(|| {
@@ -130,16 +164,56 @@ impl People {
             self.names[a as usize] = self.names[b as usize];
         }
     }
-    pub fn freeze(&mut self) {
+    pub fn freeze(mut self) -> Aliases {
+        let mut count = 0;
         for i in 0..self.names.len() {
             let r = self.root(i as u32);
             self.names[i] = self.names[r as usize];
+            count += usize::from(r as usize != i);
         }
-        self.parents = Vec::new();
-        self.size = Vec::new();
+        let cap = (count * 2 + 1).next_power_of_two();
+        let mut table = vec![(0, 0); cap];
+        for (key, id) in self.index {
+            let name = self.names[id as usize];
+            if key == name {
+                continue;
+            }
+            let mut i = mix(key) as usize & (cap - 1);
+            while table[i].0 != 0 {
+                i = (i + 1) & (cap - 1);
+            }
+            table[i] = (key, name);
+        }
+        Aliases { table }
+    }
+}
+pub struct Aliases {
+    table: Vec<(Key, Key)>,
+}
+impl Aliases {
+    #[inline]
+    pub fn prefetch(&self, k: Key) {
+        let i = mix(k) as usize & (self.table.len() - 1);
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(
+                self.table.as_ptr().add(i).cast(),
+                std::arch::x86_64::_MM_HINT_T0,
+            );
+        }
     }
     #[inline]
     pub fn canonical(&self, k: Key) -> Key {
-        self.index.get(&k).map_or(k, |&i| self.names[i as usize])
+        let mask = self.table.len() - 1;
+        let mut i = mix(k) as usize & mask;
+        loop {
+            let (key, name) = self.table[i];
+            if key == k {
+                return name;
+            }
+            if key == 0 {
+                return k;
+            }
+            i = (i + 1) & mask;
+        }
     }
 }

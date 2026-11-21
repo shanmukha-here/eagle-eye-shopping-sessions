@@ -4,14 +4,14 @@ use crate::{
 };
 use std::collections::BTreeMap;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Event {
     pub u: Key,
     pub t: i64,
     pub cents: u32,
     pub cat: u32,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Click {
     pub u: Key,
     pub t: i64,
@@ -51,6 +51,32 @@ pub struct Totals {
     counts: Vec<u32>,
     active: Vec<u32>,
     positions: Vec<usize>,
+}
+// Higher hash bits distribute users independently of the outer person shard.
+// People in different bins cannot share sessions. Only the small residual
+// bins need comparison sorting, and whales still fit into one timeline.
+fn radix_groups<T: Copy + Default>(
+    parts: Vec<Vec<T>>,
+    user: impl Fn(&T) -> Key,
+) -> (Vec<T>, [usize; 128]) {
+    let mut ends = [0usize; 128];
+    let bin = |r: &T| (crate::keys::mix(user(r)) >> 20) as usize & 127;
+    for r in parts.iter().flatten() {
+        ends[bin(r)] += 1;
+    }
+    let mut total = 0;
+    for e in &mut ends {
+        let n = *e;
+        *e = total;
+        total += n;
+    }
+    let mut grouped = vec![T::default(); total];
+    for r in parts.into_iter().flatten() {
+        let off = &mut ends[bin(&r)];
+        grouped[*off] = r;
+        *off += 1;
+    }
+    (grouped, ends)
 }
 impl Totals {
     pub fn new(cats: usize, camps: usize) -> Self {
@@ -171,9 +197,21 @@ impl Totals {
             self.counts[c as usize] = 0;
         }
     }
-    pub fn partition(&mut self, keys: &Keys, mut events: Vec<Event>, mut clicks: Vec<Click>) {
-        events.sort_unstable_by_key(|e| (e.u, e.t));
-        clicks.sort_unstable_by_key(|c| (c.u, c.t));
+    pub fn partition(&mut self, keys: &Keys, events: Vec<Vec<Event>>, clicks: Vec<Vec<Click>>) {
+        let (mut events, ee) = radix_groups(events, |r| r.u);
+        let (mut clicks, ce) = radix_groups(clicks, |r| r.u);
+        let (mut ep, mut cp) = (0, 0);
+        for bin in 0..ee.len() {
+            let es = &mut events[ep..ee[bin]];
+            let cs = &mut clicks[cp..ce[bin]];
+            es.sort_unstable_by_key(|e| (e.u, e.t));
+            cs.sort_unstable_by_key(|c| (c.u, c.t));
+            self.timelines(keys, es, cs);
+            ep = ee[bin];
+            cp = ce[bin];
+        }
+    }
+    fn timelines(&mut self, keys: &Keys, events: &[Event], clicks: &[Click]) {
         let (mut i, mut j) = (0, 0);
         while i < events.len() {
             let start = i;

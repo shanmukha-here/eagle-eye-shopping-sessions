@@ -1491,7 +1491,9 @@ fn pipeline<T: EventTime + 'static, E: Stored + 'static>(
     let pending_clicks = pending.iter().map(Vec::len).sum::<usize>();
     let mut copies = parts.into_iter();
     let mut chunks = pending.into_iter();
-    let paired_bits = env::var_os("SHOPPING_PAIRED_BITS").is_some();
+    // One two-bit word per 32 positions marks first and repeated IDs, so the
+    // collision pass touches half the cache lines of two separate bitmaps.
+    let paired_bits = env::var_os("SHOPPING_SPLIT_BITS").is_none();
     let mut tasks = Vec::with_capacity(copies.len() + chunks.len());
     while copies.len() != 0 || chunks.len() != 0 {
         if let Some(part) = copies.next() {

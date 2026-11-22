@@ -4,6 +4,7 @@ mod aggregate;
 mod compact;
 mod input;
 mod keys;
+mod opaque_names;
 mod output;
 mod pool;
 mod pages;
@@ -642,7 +643,15 @@ fn main() {
     let (start, end) = (bound("window_start"), bound("window_end"));
     fs::create_dir_all(out.join("user_daily")).unwrap();
     fs::create_dir_all(out.join("campaign_daily")).unwrap();
-    let keys = Keys::default();
+    let event_bytes = fs::read_dir(data.join("events")).unwrap().map(|entry| {
+        let entry = entry.unwrap();
+        if entry.path().extension().is_some_and(|extension| extension == "csv") {
+            entry.metadata().unwrap().len() as usize
+        } else {
+            0
+        }
+    }).sum();
+    let keys = Keys::with_event_bytes(event_bytes);
     let catalog = Catalog::read(&data, &keys);
     if end.saturating_sub(start) <= u32::MAX as i64
         && catalog.categories.len() <= 256

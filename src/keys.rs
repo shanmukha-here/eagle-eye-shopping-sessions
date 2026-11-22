@@ -8,6 +8,7 @@ use std::{
 };
 pub type Key = u64;
 const EXTERNAL: u64 = 1 << 63;
+const OVERFLOW: u64 = 1 << 62;
 const LOW: u64 = 0x7f7f7f7f7f7f7f7f;
 
 // The ninth byte occupies the unused high bits of the last seven ASCII bytes.
@@ -67,9 +68,33 @@ struct Long {
 const SHARD_BITS: u32 = 5;
 const SHARDS: usize = 1 << SHARD_BITS;
 
-#[derive(Default)]
-pub struct Keys([Mutex<Long>; SHARDS]);
+pub struct Keys {
+    table: crate::opaque_names::Table,
+    overflow: [Mutex<Long>; SHARDS],
+}
+
+impl Default for Keys {
+    fn default() -> Self {
+        Self::with_event_bytes(0)
+    }
+}
+
 impl Keys {
+    pub(super) fn with_event_bytes(event_bytes: usize) -> Self {
+        let slots = (event_bytes / 1024).clamp(1 << 16, 1 << 26).next_power_of_two();
+        Self {
+            table: crate::opaque_names::Table::with_capacity(slots),
+            overflow: Default::default(),
+        }
+    }
+
+    #[inline]
+    fn resident(&self, key: Key) -> Option<&[u8]> {
+        ((key & (EXTERNAL | OVERFLOW)) == EXTERNAL)
+            .then(|| self.table.get((key ^ EXTERNAL) as usize))
+    }
+
+
     #[inline(always)]
     pub fn key(&self, s: &[u8]) -> Key {
         if (8..=9).contains(&s.len()) {
@@ -98,21 +123,21 @@ impl Keys {
     #[cold]
     #[inline(never)]
     fn intern(&self, s: &[u8]) -> Key {
-        // IDs with a common prefix often differ near the end. Collisions only
-        // select the same lock; the map still compares the complete byte string.
-        let tail = if s.len() >= 8 {
-            u64::from_le_bytes(s[s.len() - 8..].try_into().unwrap())
-        } else {
-            let mut bytes = [0; 8];
-            bytes[..s.len()].copy_from_slice(s);
-            u64::from_le_bytes(bytes)
-        };
-        let shard = (mix(tail) >> (64 - SHARD_BITS)) as usize;
-        let mut pool = self.0[shard].lock().unwrap();
+        let hash = crate::opaque_names::hash(s);
+        if let Some(at) = self.table.intern(s, hash) {
+            return EXTERNAL | at as u64;
+        }
+        self.intern_overflow(s, hash)
+    }
+
+    #[cold]
+    fn intern_overflow(&self, s: &[u8], hash: u64) -> Key {
+        let shard = (hash >> (64 - SHARD_BITS)) as usize;
+        let mut pool = self.overflow[shard].lock().unwrap();
         if let Some(id) = pool.ids.get(s) {
             return *id;
         }
-        let id = EXTERNAL | ((pool.strings.len() as u64) << SHARD_BITS) | shard as u64;
+        let id = EXTERNAL | OVERFLOW | ((pool.strings.len() as u64) << SHARD_BITS) | shard as u64;
         pool.strings.push(s.to_vec());
         pool.ids.insert(s.to_vec(), id);
         id
@@ -123,10 +148,14 @@ impl Keys {
         bytes
     }
     pub fn append_bytes(&self, k: Key, out: &mut Vec<u8>) {
+        if let Some(name) = self.resident(k) {
+            out.extend_from_slice(name);
+            return;
+        }
         if k & EXTERNAL != 0 {
             let shard = k as usize & (SHARDS - 1);
-            let index = ((k ^ EXTERNAL) >> SHARD_BITS) as usize;
-            out.extend_from_slice(&self.0[shard].lock().unwrap().strings[index]);
+            let index = ((k ^ (EXTERNAL | OVERFLOW)) >> SHARD_BITS) as usize;
+            out.extend_from_slice(&self.overflow[shard].lock().unwrap().strings[index]);
             return;
         }
         let packed = k & LOW;
@@ -147,7 +176,15 @@ impl Keys {
                 .cmp(&(b & LOW))
                 .then_with(|| (a & !LOW).cmp(&(b & !LOW)))
         } else {
-            self.bytes(a).cmp(&self.bytes(b))
+            if a == b {
+                return Ordering::Equal;
+            }
+            match (self.resident(a), self.resident(b)) {
+                (Some(a), Some(b)) => a.cmp(b),
+                (Some(a), None) => a.cmp(&self.bytes(b)),
+                (None, Some(b)) => self.bytes(a).as_slice().cmp(b),
+                (None, None) => self.bytes(a).cmp(&self.bytes(b)),
+            }
         }
     }
 }
@@ -437,6 +474,25 @@ impl Aliases {
 #[cfg(test)]
 mod tests {
     use super::{Keys, mix, unmix};
+
+    #[test]
+    fn exact_names_survive_table_overflow() {
+        let keys = Keys {
+            table: crate::opaque_names::Table::with_capacity(1),
+            overflow: Default::default(),
+        };
+        let a = b"same-opaque-prefix-for-resident-name";
+        let b = b"same-opaque-prefix-for-overflow-name";
+        let first = keys.key(a);
+        let second = keys.key(b);
+        assert_ne!(first, second);
+        assert_eq!(keys.key(a), first);
+        assert_eq!(keys.key(b), second);
+        assert_eq!(keys.bytes(first), a);
+        assert_eq!(keys.bytes(second), b);
+        assert_eq!(keys.cmp(first, second), a.cmp(b));
+    }
+
     #[test]
     fn concurrent_components_choose_the_exact_smallest_name() {
         use super::{Graph, People};

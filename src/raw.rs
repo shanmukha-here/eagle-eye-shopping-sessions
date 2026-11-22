@@ -932,7 +932,7 @@ unsafe fn click(
     keys: &Keys,
     catalog: &Catalog,
     out: &mut Vec<Click>,
-    source: Option<crate::input::ClickSource<'_>>,
+    source: Option<crate::input::FieldSource<'_>>,
 ) -> bool {
     unsafe {
         let (mut id, mut user) = (0, 0);
@@ -964,7 +964,7 @@ unsafe fn click_opaque_tail(
     keys: &Keys,
     catalog: &Catalog,
     out: &mut Vec<Click>,
-    source: Option<crate::input::ClickSource<'_>>,
+    source: Option<crate::input::FieldSource<'_>>,
 ) -> bool {
     unsafe {
         let Some((id, next)) = read_opaque_id(p, limit) else { return false; };
@@ -993,7 +993,7 @@ pub(super) fn clicks(
     start: i64,
     end: i64,
     out: &mut Vec<Click>,
-    source: Option<crate::input::ClickSource<'_>>,
+    source: Option<crate::input::FieldSource<'_>>,
     fast: bool,
 ) {
     if fast {
@@ -1012,7 +1012,7 @@ unsafe fn click_loop(
     catalog: &Catalog,
     state: State<'_>,
     out: &mut Vec<Click>,
-    source: Option<crate::input::ClickSource<'_>>,
+    source: Option<crate::input::FieldSource<'_>>,
 ) {
     unsafe {
         let limit = data.as_ptr().add(data.len());

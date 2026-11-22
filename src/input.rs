@@ -240,7 +240,7 @@ impl Input {
         }
     }
 
-    pub(crate) fn click_name(&self, handle: u64) -> &[u8] {
+    pub(crate) fn mapped_field(&self, handle: u64) -> &[u8] {
         let file = (handle >> 48) as usize;
         let offset = ((handle >> 16) as u32) as usize;
         let length = (handle as u16) as usize;
@@ -282,8 +282,8 @@ pub struct Chunk<'a> {
     populate: bool,
 }
 impl<'a> Chunk<'a> {
-    pub(crate) fn click_source(&self) -> ClickSource<'a> {
-        ClickSource { file: self.file, index: self.file_index }
+    pub(crate) fn field_source(&self) -> FieldSource<'a> {
+        FieldSource { file: self.file, index: self.file_index }
     }
 
     pub fn read<'b>(&'b self, buf: &'b mut ReadBuffer) -> &'b [u8] {
@@ -321,13 +321,13 @@ impl<'a> Chunk<'a> {
 /// Exact reference to a name in immutable mapped input. Any unrepresentable
 /// source or field falls back to ordinary string interning.
 #[derive(Clone, Copy)]
-pub(crate) struct ClickSource<'a> {
+pub(crate) struct FieldSource<'a> {
     file: &'a [u8],
     index: usize,
 }
 
-impl ClickSource<'_> {
-    pub(crate) fn name_handle(self, name: &[u8]) -> Option<u64> {
+impl FieldSource<'_> {
+    pub(crate) fn field_handle(self, name: &[u8]) -> Option<u64> {
         let offset = name.as_ptr().addr().checked_sub(self.file.as_ptr().addr())?;
         let length = name.len();
         if length > u16::MAX as usize

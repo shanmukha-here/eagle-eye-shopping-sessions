@@ -135,11 +135,47 @@ impl Catalog {
 // Most rows have no sale and an ingest date near the reporting window.
 const SIDE: u32 = 1 << 31;
 const ARRIVAL_BIAS: i64 = (SIDE / 2) as i64;
+/// Compact nonempty identifier span. Unusually large arena spans keep
+/// their full endpoints in a private side vector.
 #[derive(Clone, Copy)]
-struct IdSpan {
-    start: usize,
-    end: usize,
+struct IdSpan(std::num::NonZeroU64);
+
+impl IdSpan {
+    const FILE: u64 = 1 << 63;
+    const WIDE: u64 = 1 << 62;
+    const LENGTH_BITS: u32 = 30;
+
+    fn file(handle: u64) -> Self {
+        Self(std::num::NonZeroU64::new(Self::FILE | handle).unwrap())
+    }
+
+    fn arena(start: usize, len: usize, wide: &mut Vec<(usize, usize)>) -> Self {
+        let bits = if start <= u32::MAX as usize && len < 1 << Self::LENGTH_BITS {
+            ((start as u64) << Self::LENGTH_BITS) | len as u64
+        } else {
+            let at = wide.len() as u64;
+            assert!(at < Self::WIDE);
+            wide.push((start, start + len));
+            Self::WIDE | at
+        };
+        Self(std::num::NonZeroU64::new(bits).unwrap())
+    }
+
+    fn bytes<'a, T>(self, bucket: &'a Bucket<T>, source: &'a Input) -> &'a [u8] {
+        let bits = self.0.get();
+        if bits & Self::FILE != 0 {
+            return source.mapped_field(bits ^ Self::FILE);
+        }
+        if bits & Self::WIDE != 0 {
+            let (start, end) = bucket.wide[(bits ^ Self::WIDE) as usize];
+            return &bucket.ids[start..end];
+        }
+        let start = (bits >> Self::LENGTH_BITS) as usize;
+        let len = (bits & ((1 << Self::LENGTH_BITS) - 1)) as usize;
+        &bucket.ids[start..start + len]
+    }
 }
+
 #[derive(Clone, Copy)]
 struct Detail {
     arrival: i64,
@@ -151,6 +187,7 @@ struct Bucket<T> {
     rows: Vec<Candidate<T>>,
     extra: Vec<Detail>,
     ids: Vec<u8>,
+    wide: Vec<(usize, usize)>,
 }
 trait EventTime: Copy + Send {
     fn pack(t: i64, start: i64) -> Self;
@@ -200,11 +237,16 @@ trait EventSink<T: EventTime> {
     }
 }
 
-impl<T: EventTime> EventSink<T> for [Bucket<T>] {
+struct EventStore<'a, T> {
+    bins: &'a mut [Bucket<T>],
+    source: Option<input::FieldSource<'a>>,
+}
+
+impl<T: EventTime> EventSink<T> for EventStore<'_, T> {
     #[inline(always)]
     fn push(&mut self, mut row: Candidate<T>, detail: Option<Detail>) {
-        let bucket = row.id as usize & (self.len() - 1);
-        let bin = &mut self[bucket];
+        let bucket = row.id as usize & (self.bins.len() - 1);
+        let bin = &mut self.bins[bucket];
         if let Some(detail) = detail {
             row.arrival = SIDE | bin.extra.len() as u32;
             bin.extra.push(detail);
@@ -213,15 +255,16 @@ impl<T: EventTime> EventSink<T> for [Bucket<T>] {
     }
 
     fn push_opaque(&mut self, mut row: Candidate<T>, mut detail: Detail, id: &[u8], _: &Keys) {
-        const HASH: ahash::RandomState = ahash::RandomState::with_seeds(
-            0x243f6a8885a308d3, 0x13198a2e03707344, 0xa4093822299f31d0, 0x082efa98ec4e6c89,
-        );
-        row.id = HASH.hash_one(id);
-        let bucket = row.id as usize & (self.len() - 1);
-        let ids = &mut self[bucket].ids;
-        let start = ids.len();
-        ids.extend_from_slice(id);
-        detail.opaque = Some(IdSpan { start, end: ids.len() });
+        row.id = crate::opaque_names::hash(id);
+        detail.opaque = Some(if let Some(handle) = self.source.and_then(|source| source.field_handle(id)) {
+            IdSpan::file(handle)
+        } else {
+            let bucket = row.id as usize & (self.bins.len() - 1);
+            let bin = &mut self.bins[bucket];
+            let start = bin.ids.len();
+            bin.ids.extend_from_slice(id);
+            IdSpan::arena(start, id.len(), &mut bin.wide)
+        });
         self.push(row, Some(detail));
     }
 }
@@ -349,14 +392,14 @@ impl OpaqueWinner {
         parts[self.part].extra[(row.arrival ^ SIDE) as usize]
     }
 
-    fn id<T: Copy>(self, parts: &[Bucket<T>]) -> &[u8] {
-        let span = self.detail(parts).opaque.unwrap();
-        &parts[self.part].ids[span.start..span.end]
+    fn id<'a, T: Copy>(self, parts: &'a [Bucket<T>], source: &'a Input) -> &'a [u8] {
+        self.detail(parts).opaque.unwrap().bytes(&parts[self.part], source)
     }
 }
 
 fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
     parts: Vec<Bucket<T>>,
+    source: &Input,
     people: &Aliases,
     out: &mut [Vec<E>],
     start: i64,
@@ -423,11 +466,11 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
                 }
                 if let Some(span) = detail.opaque {
                     use hashbrown::hash_table::Entry;
-                    let id = &bin.ids[span.start..span.end];
+                    let id = span.bytes(bin, source);
                     let candidate = OpaqueWinner { part, row: block_number * group + within_block };
                     match routes.opaque.entry(
                         row.id,
-                        |winner| winner.id(&parts) == id,
+                        |winner| winner.id(&parts, source) == id,
                         |winner| winner.candidate(&parts).id,
                     ) {
                         Entry::Vacant(entry) => { entry.insert(candidate); }
@@ -520,7 +563,7 @@ fn clicks(
     start: i64,
     end: i64,
     out: &mut Vec<Click>,
-    source: Option<input::ClickSource<'_>>,
+    source: Option<input::FieldSource<'_>>,
 ) {
     rows::<4>(
         data,
@@ -698,6 +741,7 @@ fn pipeline<T: EventTime, E: Stored>(
     mut stage: impl FnMut(&str),
 ) {
     let raw = Input::open_for_scan(&data.join("events"));
+    let borrow_events = env::var_os("SHOPPING_BORROW_EVENT_IDS").is_some();
     // Each valid event consumes at least six bytes for separators.
     let narrow = raw.bytes() / 6 <= i32::MAX as usize;
     let n = ((raw.bytes() / (6 << 20)).max(1))
@@ -768,6 +812,7 @@ fn pipeline<T: EventTime, E: Stored>(
                             rows: Vec::with_capacity(expected),
                             extra: Vec::new(),
                             ids: Vec::new(),
+                            wide: Vec::new(),
                         })
                         .collect::<Vec<_>>(),
                     input::ReadBuffer::new(),
@@ -780,7 +825,12 @@ fn pipeline<T: EventTime, E: Stored>(
             },
             move |s, task| match task {
                 Scan::Events(chunk) => {
-                    let data = chunk.read(&mut s.2);
+                    let (data, source) = if borrow_events {
+                        (chunk.records(), Some(chunk.field_source()))
+                    } else {
+                        (chunk.read(&mut s.2), None)
+                    };
+                    let mut sink = EventStore { bins: &mut s.1, source };
                     if fast {
                         let seen = raw::events(
                             data,
@@ -790,19 +840,19 @@ fn pipeline<T: EventTime, E: Stored>(
                             &clock,
                             start,
                             end,
-                            &mut s.1[..],
+                            &mut sink,
                             level,
                         );
                         s.4[0] += seen[0];
                         s.4[1] += seen[1];
                     } else {
-                        events(data, &mut s.0, &keys, &catalog, start, end, &mut s.1[..]);
+                        events(data, &mut s.0, &keys, &catalog, start, end, &mut sink);
                     }
                 }
                 Scan::Clicks(chunk) => {
                     let mut pending = Vec::new();
                     let (bytes, source) = if borrowed_click_ids {
-                        (chunk.records(), Some(chunk.click_source()))
+                        (chunk.records(), Some(chunk.field_source()))
                     } else {
                         (chunk.read(&mut s.2), None)
                     };
@@ -868,7 +918,9 @@ fn pipeline<T: EventTime, E: Stored>(
     // Every parser has joined. Release the input page tables while workers
     // reduce events, so the main thread need not unmap gigabytes at a barrier.
     let release_inputs = pool_scope.spawn(move || {
-        raw.release_pages();
+        if !borrow_events {
+            raw.release_pages();
+        }
         if !borrowed_click_ids {
             click_input.release_pages();
         }
@@ -899,9 +951,9 @@ fn pipeline<T: EventTime, E: Stored>(
         move |s, task| match task {
             Work::Copies(part) => {
                 if paired_bits {
-                    winners::<T, E, true>(part, &people, &mut s.0, start, group, &mut s.2);
+                    winners::<T, E, true>(part, raw, &people, &mut s.0, start, group, &mut s.2);
                 } else {
-                    winners::<T, E, false>(part, &people, &mut s.0, start, group, &mut s.2);
+                    winners::<T, E, false>(part, raw, &people, &mut s.0, start, group, &mut s.2);
                 }
             }
             Work::Clicks(chunk) => route_clicks(&people, &chunk, &mut s.1, group),
@@ -916,6 +968,9 @@ fn pipeline<T: EventTime, E: Stored>(
     let event_parts = transpose(events, person_shards);
     let click_parts = transpose(clicks, person_shards);
     release_inputs.join().unwrap();
+    if borrow_events {
+        pool_scope.spawn(move || raw.release_pages());
+    }
     stage("event dedup and click routing");
     let mut work: Vec<_> = event_parts.into_iter().zip(click_parts).collect();
     if env::var_os("SHOPPING_HEAVIEST_FIRST").is_some() {

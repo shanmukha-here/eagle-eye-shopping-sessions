@@ -96,7 +96,7 @@ impl Keys {
         match key & (EXTERNAL | OVERFLOW | CLICK_INPUT) {
             EXTERNAL => Some(self.table.get((key ^ EXTERNAL) as usize)),
             bits if bits == EXTERNAL | CLICK_INPUT => {
-                Some(self.click_input.as_ref().unwrap().click_name(key ^ bits))
+                Some(self.click_input.as_ref().unwrap().mapped_field(key ^ bits))
             }
             _ => None,
         }
@@ -129,9 +129,9 @@ impl Keys {
         self.intern(s)
     }
     #[inline]
-    pub(crate) fn click_key(&self, id: &[u8], source: Option<crate::input::ClickSource<'_>>) -> Key {
+    pub(crate) fn click_key(&self, id: &[u8], source: Option<crate::input::FieldSource<'_>>) -> Key {
         if id.len() > 9 {
-            if let Some(handle) = source.and_then(|source| source.name_handle(id)) {
+            if let Some(handle) = source.and_then(|source| source.field_handle(id)) {
                 return EXTERNAL | CLICK_INPUT | handle;
             }
         }

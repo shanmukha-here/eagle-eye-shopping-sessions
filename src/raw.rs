@@ -2,7 +2,7 @@
 //! all rows that fail the shape, clock, or field checks.
 use crate::input::{DAY, Dates, INVALID, WEEK};
 use crate::keys::{Keys, mix, pack_ninth};
-use crate::{ARRIVAL_BIAS, Candidate, Catalog, Click, EventSink, EventTime, SIDE};
+use crate::{ARRIVAL_BIAS, Candidate, Catalog, Click, Detail, EventSink, EventTime, SIDE};
 use std::arch::x86_64::*;
 
 pub(super) fn available() -> bool {
@@ -555,7 +555,11 @@ unsafe fn event_prefix<T: EventTime>(
 // An unsupported shape leaves the cursor untouched for the existing reader.
 #[inline(always)]
 unsafe fn event_tail_scan<T: EventTime>(
-    p: Ptr, limit: Ptr, state: State<'_>, emit: &mut (impl EventSink<T> + ?Sized),
+    p: Ptr,
+    limit: Ptr,
+    state: State<'_>,
+    keys: &Keys,
+    emit: &mut (impl EventSink<T> + ?Sized),
 ) -> Ptr {
     unsafe {
         if limit.offset_from(p) < 128 {
@@ -563,30 +567,68 @@ unsafe fn event_tail_scan<T: EventTime>(
         }
         let (mut id, mut user) = (0, 0);
         let clock = two_ids::<true, true>(p, b',', &mut id, &mut user);
-        if clock.is_null() { return std::ptr::null(); }
+        if clock.is_null() {
+            return event_opaque_tail(p, limit, state, keys, emit);
+        }
+        let Some(tail) = checked_event_tail(clock, limit, state) else {
+            return std::ptr::null();
+        };
+        let valid = tail.in_window(state);
+        emit.push(Candidate {
+            id: mix(id),
+            user: if valid { mix(user) } else { 0 },
+            arrival: tail.offset,
+            t: T::pack(if valid { tail.time } else { INVALID }, state.start),
+        }, None);
+        tail.next
+    }
+}
+
+struct CheckedEventTail {
+    time: i64,
+    arrival_ms: i64,
+    offset: u32,
+    next: Ptr,
+}
+
+impl CheckedEventTail {
+    #[inline(always)]
+    fn in_window(&self, state: State<'_>) -> bool {
+        self.time >= state.start && self.time < state.end && self.time >= self.arrival_ms - DAY
+    }
+}
+
+// The tail reads at most 90 bytes after the first timestamp, including the
+// unaligned vector containing its row ending.
+#[inline(always)]
+unsafe fn checked_event_tail(clock: Ptr, limit: Ptr, state: State<'_>) -> Option<CheckedEventTail> {
+    unsafe {
+        if limit.offset_from(clock) < 96 {
+            return None;
+        }
         let q = usize::from(clock.read() == b'"');
         let ts = clock.add(q);
         let width = if ts.add(4).read() != b'-' { 13 }
             else if ts.add(19).read() == b'Z' { 20 }
             else { 25 };
         let arrival = suffix(ts, width, q, b',');
-        if arrival.is_null() { return std::ptr::null(); }
+        if arrival.is_null() { return None; }
         let q = usize::from(arrival.read() == b'"');
         let received = arrival.add(q);
         let tail = suffix(received, 20, q, b',');
-        if tail.is_null() { return std::ptr::null(); }
+        if tail.is_null() { return None; }
         let q = usize::from(tail.read() == b'"');
         let kind = tail.add(q);
         let kind_word = kind.cast::<u32>().read_unaligned();
         if kind_word != u32::from_le_bytes(*b"view") && kind_word != u32::from_le_bytes(*b"cart") {
-            return std::ptr::null();
+            return None;
         }
         let product = suffix(kind, 4, q, b',');
-        if product.is_null() { return std::ptr::null(); }
+        if product.is_null() { return None; }
         let bytes = _mm256_loadu_si256(product.cast());
         let mask = |c| _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(c))) as u32;
         let lf = mask(b'\n' as i8);
-        if lf == 0 { return std::ptr::null(); }
+        if lf == 0 { return None; }
         let width_tail = lf.trailing_zeros();
         // All earlier fields are proved below and cannot contain an LF.
         let live = lf ^ lf.wrapping_sub(1);
@@ -602,7 +644,7 @@ unsafe fn event_tail_scan<T: EventTime>(
             || (price_quote != 0 && (width_tail <= cut + 2
                 || price_quote != ((separators << 1) | (1 << (width_tail - 1)))))
         {
-            return std::ptr::null();
+            return None;
         }
         let time = match width {
             13 => stamp::<13>(ts, state.clock),
@@ -614,19 +656,79 @@ unsafe fn event_tail_scan<T: EventTime>(
         if time == INVALID || day == INVALID || millis == INVALID
             || received.add(10).read() != b'T' || received.add(19).read() != b'Z'
         {
-            return std::ptr::null();
+            return None;
         }
         let arrived = day + millis;
         let offset = arrived / 1000 - state.start / 1000 + ARRIVAL_BIAS;
         if offset as u64 >= u64::from(SIDE) {
-            return std::ptr::null();
+            return None;
         }
-        let valid = time >= state.start && time < state.end && time >= arrived - DAY;
-        emit.push(Candidate {
-            id: mix(id), user: if valid { mix(user) } else { 0 },
-            arrival: offset as u32, t: T::pack(if valid { time } else { INVALID }, state.start),
-        }, None);
-        product.add(width_tail as usize + 1)
+        Some(CheckedEventTail {
+            time,
+            arrival_ms: arrived,
+            offset: offset as u32,
+            next: product.add(width_tail as usize + 1),
+        })
+    }
+}
+
+// Frame an ID field using only the available bytes. Wider fields take the
+// general scanner.
+#[inline]
+unsafe fn read_opaque_id<'a>(p: Ptr, limit: Ptr) -> Option<(&'a [u8], Ptr)> {
+    unsafe {
+        let available = limit.offset_from(p) as usize;
+        let comma = libc::memchr(p.cast(), i32::from(b','), available.min(64)).cast::<u8>();
+        if comma.is_null() {
+            return None;
+        }
+        let wire = std::slice::from_raw_parts(p, comma.offset_from(p) as usize);
+        let value = if let Some(quoted) = wire.strip_prefix(&[b'"']) {
+            quoted.strip_suffix(&[b'"'])?
+        } else {
+            wire
+        };
+        if value.is_empty()
+            || !libc::memchr(value.as_ptr().cast(), i32::from(b'\n'), value.len()).is_null()
+            || !libc::memchr(value.as_ptr().cast(), i32::from(b'"'), value.len()).is_null()
+        {
+            return None;
+        }
+        Some((value, comma.add(1)))
+    }
+}
+
+#[inline(never)]
+unsafe fn event_opaque_tail<T: EventTime>(
+    p: Ptr,
+    limit: Ptr,
+    state: State<'_>,
+    keys: &Keys,
+    emit: &mut (impl EventSink<T> + ?Sized),
+) -> Ptr {
+    unsafe {
+        let Some((id, next)) = read_opaque_id(p, limit) else { return std::ptr::null(); };
+        let Some((user, clock)) = read_opaque_id(next, limit) else { return std::ptr::null(); };
+        let Some(tail) = checked_event_tail(clock, limit, state) else { return std::ptr::null(); };
+        let valid = tail.in_window(state);
+        let mut row = Candidate {
+            id: 0,
+            user: if valid { mix(keys.key(user)) } else { 0 },
+            arrival: tail.offset,
+            t: T::pack(if valid { tail.time } else { INVALID }, state.start),
+        };
+        if id.len() > 9 {
+            emit.push_opaque(row, Detail {
+                arrival: tail.arrival_ms / 1000,
+                cents: 0,
+                category: 0,
+                opaque: None,
+            }, id, keys);
+        } else {
+            row.id = mix(keys.key(id));
+            emit.push(row, None);
+        }
+        tail.next
     }
 }
 
@@ -660,7 +762,7 @@ unsafe fn event_cursors<const N: usize, const PREFIX: bool, const TAIL_SCAN: boo
                 }
                 active = true;
                 if TAIL_SCAN {
-                    let following = event_tail_scan::<T>(p, ends[i], state, emit);
+                    let following = event_tail_scan::<T>(p, ends[i], state, keys, emit);
                     if !following.is_null() {
                         count[0] += 1;
                         cursor[i] = following;

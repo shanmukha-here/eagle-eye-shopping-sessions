@@ -1099,7 +1099,10 @@ fn release_before_exit(pool: &pool::Pool) {
         eprintln!("exit release: {count} regions, {total} bytes, {} parts", lanes + 1);
     }
     ZAP[0].store(count, Relaxed);
-    ZAP[1].store(total.div_ceil(lanes + 1).next_multiple_of(2 << 20), Relaxed);
+    // Page freeing contends in the kernel: on the lab, 4 parts finish in
+    // 75-83 ms, 9 parts in 86-90 ms and 1 part in 123-156 ms.
+    let zappers = (lanes + 1).min(4);
+    ZAP[1].store(total.div_ceil(zappers).next_multiple_of(2 << 20), Relaxed);
     ZAP[2].store(lanes + 1, Release);
     fn zap(part: usize) {
         let (count, share) = (ZAP[0].load(Relaxed), ZAP[1].load(Relaxed));

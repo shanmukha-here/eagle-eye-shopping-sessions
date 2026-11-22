@@ -857,7 +857,9 @@ fn pipeline<T: EventTime, E: Stored>(
     let borrow_events = env::var_os("SHOPPING_BORROW_EVENT_IDS").is_some() && raw.prepare_revisit();
     // Each valid event consumes at least six bytes for separators.
     let narrow = raw.bytes() / 6 <= i32::MAX as usize;
-    let n = ((raw.bytes() / (6 << 20)).max(1))
+    let bucket_bytes = env::var("SHOPPING_BUCKET_KB").ok()
+        .and_then(|value| value.parse::<usize>().ok()).unwrap_or(6 << 10) << 10;
+    let n = ((raw.bytes() / bucket_bytes).max(1))
         .next_power_of_two()
         .min(4096);
     let people = std::sync::Mutex::new(None);
@@ -887,7 +889,8 @@ fn pipeline<T: EventTime, E: Stored>(
     }
     let early_clicks = env::var_os("SHOPPING_EARLY_CLICKS").is_some();
     let interleave = env::var_os("SHOPPING_INTERLEAVE_CLICKS").is_some();
-    let person_shards = n.min(512);
+    let person_shards = n.min(env::var("SHOPPING_PERSON_SHARDS").ok()
+        .and_then(|value| value.parse::<usize>().ok()).unwrap_or(512).next_power_of_two());
     let group = env::var("SHOPPING_PREFETCH_GROUP").ok()
         .and_then(|value| value.parse::<usize>().ok()).unwrap_or(32).clamp(1, 128);
     let mut click_chunks = click_input.chunks().into_iter();

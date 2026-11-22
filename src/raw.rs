@@ -613,11 +613,19 @@ unsafe fn event_tail_scan<T: EventTime>(
         if limit.offset_from(p) < 128 {
             return std::ptr::null();
         }
-        let (mut id, mut user) = (0, 0);
-        let clock = two_ids::<true, true>(p, b',', &mut id, &mut user);
-        if clock.is_null() {
+        // Frame both IDs from the comma mask. A quoted or eight-byte ID
+        // takes the same path as a plain nine-byte one.
+        let commas = _mm256_set1_epi8(b',' as i8);
+        let head = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(p.cast()), commas)) as u32;
+        let first = head.trailing_zeros() as usize;
+        let rest = head & head.wrapping_sub(1);
+        let second = rest.trailing_zeros() as usize;
+        let (id, id_ok) = bounded_key(p, first);
+        let (user, user_ok) = bounded_key(p.add(first + 1), second.wrapping_sub(first + 1));
+        if !((second < 32) & id_ok & user_ok) {
             return event_opaque_tail(p, limit, state, keys, emit);
         }
+        let clock = p.add(second + 1);
         let Some(tail) = checked_event_tail(clock, limit, state) else {
             return std::ptr::null();
         };
@@ -741,11 +749,15 @@ unsafe fn event_tail_body<const PURCHASE: bool>(clock: Ptr, limit: Ptr, state: S
         let before = separators.wrapping_sub(1);
         let product_quote = quote_bits & before;
         let price_quote = quote_bits & !before & !separators;
-        if separators.count_ones() != 1 || cut == 0
-            || (product_quote != 0 && (cut < 3 || product_quote != (1 | 1 << (cut - 1))))
-            || (price_quote != 0 && (width_tail <= cut + 2
-                || price_quote != ((separators << 1) | (1 << (width_tail - 1)))))
-        {
+        // Field quoting varies row by row, so the framing proofs combine
+        // without branches.
+        let framing_bad = (separators.count_ones() != 1) | (cut == 0)
+            | ((product_quote != 0)
+                & ((cut < 3) | (product_quote != (1 | 1u32.wrapping_shl(cut.wrapping_sub(1))))))
+            | ((price_quote != 0)
+                & ((width_tail <= cut + 2)
+                    | (price_quote != ((separators << 1) | 1u32.wrapping_shl(width_tail.wrapping_sub(1))))));
+        if framing_bad {
             return None;
         }
         let day = state.clock.day(received);

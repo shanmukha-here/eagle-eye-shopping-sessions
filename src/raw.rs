@@ -860,23 +860,21 @@ pub(super) fn events<T: EventTime>(
 }
 
 #[inline(always)]
-unsafe fn click(
-    p: Ptr,
+unsafe fn click_tail(
+    campaign: Ptr,
     end: Ptr,
     state: State<'_>,
     catalog: &Catalog,
-    out: &mut Vec<Click>,
-) -> bool {
+) -> Option<(i64, u32)> {
     unsafe {
-        let (mut id, mut user) = (0, 0);
-        let campaign = two_ids::<true, true>(p, b',', &mut id, &mut user);
-        if campaign.is_null() {
-            return false;
+        // The shortest accepted tail contains c_0, a comma, and 13 digits.
+        if end.offset_from(campaign) < 17 {
+            return None;
         }
         let q = usize::from(campaign.read() == b'"');
         let label = campaign.add(q);
         if label.cast::<u16>().read_unaligned() != u16::from_le_bytes(*b"c_") {
-            return false;
+            return None;
         }
         let digits = label.add(2);
         let mut len = 0;
@@ -893,39 +891,90 @@ unsafe fn click(
             || (len > 1 && digits.read() == b'0')
             || number >= catalog.campaigns.values.len()
         {
-            return false;
+            return None;
         }
         let code = *catalog.campaigns.values.get_unchecked(number);
         if code == u32::MAX {
-            return false;
+            return None;
         }
         let clock = suffix(label, 2 + len, q, b',');
         if clock.is_null() {
-            return false;
+            return None;
         }
         let q = usize::from(clock.read() == b'"');
         let stamp_ptr = clock.add(q);
         if stamp_ptr > end {
-            return false;
+            return None;
         }
         let width = end.offset_from(stamp_ptr) as usize;
         if width < q || (q == 1 && end.sub(1).read() != b'"') {
-            return false;
+            return None;
         }
         let time = match width - q {
             13 => stamp::<13>(stamp_ptr, state.clock),
             20 => stamp::<20>(stamp_ptr, state.clock),
             25 => stamp::<25>(stamp_ptr, state.clock),
-            _ => return false,
+            _ => return None,
         };
         if time == INVALID {
-            return false;
+            return None;
         }
+        Some((time, code))
+    }
+}
+
+#[inline(always)]
+unsafe fn click(
+    p: Ptr,
+    end: Ptr,
+    limit: Ptr,
+    state: State<'_>,
+    keys: &Keys,
+    catalog: &Catalog,
+    out: &mut Vec<Click>,
+) -> bool {
+    unsafe {
+        let (mut id, mut user) = (0, 0);
+        let campaign = two_ids::<true, true>(p, b',', &mut id, &mut user);
+        if campaign.is_null() {
+            return click_opaque_tail(p, end, limit, state, keys, catalog, out);
+        }
+        let Some((time, code)) = click_tail(campaign, end, state, catalog) else {
+            return false;
+        };
         if time >= state.start - WEEK && time < state.end {
             out.push(Click {
                 u: mix(user),
                 t: time,
                 id,
+                campaign: code,
+            });
+        }
+        true
+    }
+}
+
+#[cold]
+unsafe fn click_opaque_tail(
+    p: Ptr,
+    end: Ptr,
+    limit: Ptr,
+    state: State<'_>,
+    keys: &Keys,
+    catalog: &Catalog,
+    out: &mut Vec<Click>,
+) -> bool {
+    unsafe {
+        let Some((id, next)) = read_opaque_id(p, limit) else { return false; };
+        let Some((user, campaign)) = read_opaque_id(next, limit) else { return false; };
+        let Some((time, code)) = click_tail(campaign, end, state, catalog) else {
+            return false;
+        };
+        if time >= state.start - WEEK && time < state.end {
+            out.push(Click {
+                u: mix(keys.key(user)),
+                t: time,
+                id: keys.key(id),
                 campaign: code,
             });
         }
@@ -969,7 +1018,7 @@ unsafe fn click_loop(
             let next = end.add(usize::from(end < limit));
             if limit.offset_from(p) < 128
                 || end.offset_from(p) < 32
-                || !click(p, end, state, catalog, out)
+                || !click(p, end, limit, state, keys, catalog, out)
             {
                 let row = std::slice::from_raw_parts(p, next.offset_from(p) as usize);
                 crate::clicks(row, date, keys, catalog, state.start, state.end, out);

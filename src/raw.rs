@@ -908,6 +908,8 @@ unsafe fn event_opaque_tail<T: EventTime>(
     }
 }
 
+const ROW_PREFETCH: usize = 4096;
+
 #[target_feature(enable = "avx2")]
 unsafe fn event_cursors<const N: usize, const PREFIX: bool, const TAIL_SCAN: bool, const COUNT: bool, T: EventTime>(
     data: &[u8],
@@ -937,6 +939,10 @@ unsafe fn event_cursors<const N: usize, const PREFIX: bool, const TAIL_SCAN: boo
                     continue;
                 }
                 active = true;
+                // The hardware streamer stops at 4 KiB page boundaries, so
+                // each new page of a mapped file would stall the decoder.
+                // Prefetches past the mapping cannot fault.
+                _mm_prefetch::<_MM_HINT_T0>(p.wrapping_add(ROW_PREFETCH).cast());
                 if TAIL_SCAN {
                     let following = event_tail_scan::<T>(p, ends[i], state, keys, emit);
                     if !following.is_null() {

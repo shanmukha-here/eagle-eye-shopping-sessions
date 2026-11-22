@@ -273,6 +273,19 @@ pub struct Chunk<'a> {
     populate: bool,
 }
 impl<'a> Chunk<'a> {
+    pub fn full_bytes<'b>(&'b self, buf: &'b mut ReadBuffer) -> &'b [u8] {
+        use std::os::unix::fs::FileExt;
+        if let Some(fd) = self.buffered {
+            if let Some(bytes) = buf.bytes(self.end - self.start) {
+                if fd.read_exact_at(bytes, self.start as u64).is_ok() {
+                    return bytes;
+                }
+            }
+        }
+        self.populate_range();
+        &self.file[self.start..self.end]
+    }
+
     pub fn read<'b>(&'b self, buf: &'b mut ReadBuffer) -> &'b [u8] {
         use std::os::unix::fs::FileExt;
         if let Some(fd) = self.buffered {
@@ -292,6 +305,11 @@ impl<'a> Chunk<'a> {
     }
 
     pub fn records(self) -> &'a [u8] {
+        self.populate_range();
+        owned_records(&self.file[self.start..], self.end - self.start, true).unwrap()
+    }
+
+    fn populate_range(&self) {
         if self.populate {
             // The mapping base and chunk starts are page-aligned. The tail
             // can be short because the kernel rounds the advised size up.
@@ -301,7 +319,6 @@ impl<'a> Chunk<'a> {
                                       libc::MADV_POPULATE_READ);
             }
         }
-        owned_records(&self.file[self.start..], self.end - self.start, true).unwrap()
     }
 }
 

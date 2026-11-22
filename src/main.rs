@@ -3,6 +3,7 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod aggregate;
 mod compact;
 mod input;
+mod io_probe;
 mod keys;
 mod output;
 mod pool;
@@ -522,6 +523,7 @@ fn main() {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(8)
         .clamp(1, 64);
+    io_probe::run(&data, threads);
     let mut mark = Instant::now();
     let mut last = env::var_os("SHOPPING_PHASE_USAGE").map(|_| usage());
     let stage = |name: &str| {
@@ -868,5 +870,5 @@ fn finish(
     unsafe extern "C" {
         fn _exit(status: std::ffi::c_int) -> !;
     }
-    unsafe { _exit(0) }
+    unsafe { _exit(i32::from(io_probe::status())) }
 }

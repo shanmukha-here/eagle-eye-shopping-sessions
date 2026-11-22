@@ -487,10 +487,10 @@ impl Aliases {
         for (i, record) in records.iter().enumerate() {
             let k = key(record);
             let tagged = self.homes[k as usize & mask].load(Relaxed) & Self::tag(k) != 0;
-            if tagged {
-                self.prefetch(k);
-                need_alias |= 1u128 << i;
-            }
+            // Keys pass the filter at random. An untagged key
+            // prefetches slot zero, which stays cached, instead of branching.
+            self.prefetch(if tagged { k } else { 0 });
+            need_alias |= u128::from(tagged) << i;
         }
         need_alias
     }

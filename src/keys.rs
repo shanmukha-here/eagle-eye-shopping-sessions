@@ -334,6 +334,13 @@ impl Graph {
                 .collect(),
         )
     }
+    /// Start loading the first slot `join` probes for this key.
+    #[inline(always)]
+    pub fn prefetch(&self, key: Key) {
+        let at = self.0.as_ptr().wrapping_add(mix(key) as usize & (self.0.len() - 1));
+        unsafe { std::arch::x86_64::_mm_prefetch(at.cast(), std::arch::x86_64::_MM_HINT_T0) };
+    }
+
     fn node(&self, key: Key) -> Option<usize> {
         let mask = self.0.len() - 1;
         let mut i = key as usize & mask;

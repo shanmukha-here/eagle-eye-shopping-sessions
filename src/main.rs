@@ -694,11 +694,28 @@ fn read_people(data: &Path, keys: &Keys, threads: usize, fast: bool) -> Aliases 
             |_| true,
             |ok, chunk| {
                 if *ok {
+                    // Components do not depend on join order, so pairs wait in
+                    // small batches while their vertex slots load.
+                    const BATCH: usize = 32;
+                    let mut batch = [(0, 0); BATCH];
+                    let mut held = 0;
+                    let mut good = true;
                     raw::links(chunk.records(), keys, fast, |a, b| {
-                        if graph.join(keys, a, b).is_none() {
-                            *ok = false;
+                        graph.prefetch(a);
+                        graph.prefetch(b);
+                        batch[held] = (a, b);
+                        held += 1;
+                        if held == BATCH {
+                            for &(a, b) in &batch {
+                                good &= graph.join(keys, a, b).is_some();
+                            }
+                            held = 0;
                         }
                     });
+                    for &(a, b) in &batch[..held] {
+                        good &= graph.join(keys, a, b).is_some();
+                    }
+                    *ok = good;
                 }
             },
         );

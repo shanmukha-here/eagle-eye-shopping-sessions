@@ -969,6 +969,7 @@ fn main() {
     fs::create_dir_all(out.join("user_daily")).unwrap();
     fs::create_dir_all(out.join("campaign_daily")).unwrap();
     let event_bytes = csv_bytes(&data.join("events"));
+    huge_page_policy(event_bytes + csv_bytes(&data.join("clicks")) + csv_bytes(&data.join("links")));
     // Only the 32-bit clock layout is reserved ahead; the parser checks the
     // type and the sizes before it takes a reservation.
     let prepared = (end.saturating_sub(start) <= u32::MAX as i64)
@@ -1017,6 +1018,39 @@ fn csv_bytes(folder: &Path) -> usize {
             0
         }
     }).sum()
+}
+
+/// Huge pages make the in-memory stages faster, but on a host without room
+/// for the input's page cache plus about 0.7 times its size in tables,
+/// huge-page faults compact memory and evicted input is read again (lab,
+/// 60M: 2.3-3.3 s with huge pages, 2.0-2.1 s without). Turn them off for
+/// the process when reclaimable memory is under three times the input.
+fn huge_page_policy(input_bytes: usize) {
+    let available = || -> Option<usize> {
+        let info = fs::read_to_string("/proc/meminfo").ok()?;
+        let line = info.lines().find(|line| line.starts_with("MemAvailable:"))?;
+        let host = line.split_whitespace().nth(1)?.parse::<usize>().ok()? << 10;
+        let group = (|| {
+            let limit = fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?.trim().parse::<usize>().ok()?;
+            let used = fs::read_to_string("/sys/fs/cgroup/memory.current").ok()?.trim().parse::<usize>().ok()?;
+            Some(limit.saturating_sub(used))
+        })();
+        Some(group.map_or(host, |group| group.min(host)))
+    };
+    let room = available();
+    let off = match env::var("SHOPPING_THP").as_deref() {
+        Ok("on") => false,
+        Ok("off") => true,
+        _ => room.is_some_and(|room| room < input_bytes.saturating_mul(3)),
+    };
+    if off {
+        // Affects every later fault of this process, including mappings
+        // already advised for huge pages.
+        unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0) };
+    }
+    if env::var_os("SHOPPING_PHASE_USAGE").is_some() {
+        eprintln!("huge pages {} for {input_bytes} input bytes, {room:?} available", if off { "off" } else { "on" });
+    }
 }
 
 fn bucket_count(event_bytes: usize) -> usize {

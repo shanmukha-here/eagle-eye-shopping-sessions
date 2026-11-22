@@ -677,24 +677,42 @@ unsafe fn checked_event_tail(clock: Ptr, limit: Ptr, state: State<'_>) -> Option
 #[inline]
 unsafe fn read_opaque_id<'a>(p: Ptr, limit: Ptr) -> Option<(&'a [u8], Ptr)> {
     unsafe {
-        let available = limit.offset_from(p) as usize;
-        let comma = libc::memchr(p.cast(), i32::from(b','), available.min(64)).cast::<u8>();
-        if comma.is_null() {
+        if limit.offset_from(p) < 64 {
             return None;
         }
-        let wire = std::slice::from_raw_parts(p, comma.offset_from(p) as usize);
-        let value = if let Some(quoted) = wire.strip_prefix(&[b'"']) {
-            quoted.strip_suffix(&[b'"'])?
+        let comma = _mm256_set1_epi8(b',' as i8);
+        let quote = _mm256_set1_epi8(b'"' as i8);
+        let lf = _mm256_set1_epi8(b'\n' as i8);
+        let first = _mm256_loadu_si256(p.cast());
+        let extract = |bytes, value| u64::from(
+            _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, value)) as u32,
+        );
+        let mut commas = extract(first, comma);
+        let mut quotes = extract(first, quote);
+        let mut lines = extract(first, lf);
+        if commas == 0 {
+            let second = _mm256_loadu_si256(p.add(32).cast());
+            commas = extract(second, comma) << 32;
+            quotes |= extract(second, quote) << 32;
+            lines |= extract(second, lf) << 32;
+        }
+        let end = commas.trailing_zeros() as usize;
+        if end == 0 || end == 64 {
+            return None;
+        }
+        let active = (1_u64 << end) - 1;
+        if lines & active != 0 {
+            return None;
+        }
+        let quotes = quotes & active;
+        let field = if quotes == 0 {
+            std::slice::from_raw_parts(p, end)
+        } else if end >= 3 && quotes == 1 | (1_u64 << (end - 1)) {
+            std::slice::from_raw_parts(p.add(1), end - 2)
         } else {
-            wire
-        };
-        if value.is_empty()
-            || !libc::memchr(value.as_ptr().cast(), i32::from(b'\n'), value.len()).is_null()
-            || !libc::memchr(value.as_ptr().cast(), i32::from(b'"'), value.len()).is_null()
-        {
             return None;
-        }
-        Some((value, comma.add(1)))
+        };
+        Some((field, p.add(end + 1)))
     }
 }
 

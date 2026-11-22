@@ -551,8 +551,87 @@ unsafe fn event_prefix<T: EventTime>(
     }
 }
 
+// Prove the row from field to field and find its LF in the tail load.
+// An unsupported shape leaves the cursor untouched for the existing reader.
+#[inline(always)]
+unsafe fn event_tail_scan<T: EventTime>(
+    p: Ptr, limit: Ptr, state: State<'_>, emit: &mut (impl EventSink<T> + ?Sized),
+) -> Ptr {
+    unsafe {
+        if limit.offset_from(p) < 128 {
+            return std::ptr::null();
+        }
+        let (mut id, mut user) = (0, 0);
+        let clock = two_ids::<true, true>(p, b',', &mut id, &mut user);
+        if clock.is_null() { return std::ptr::null(); }
+        let q = usize::from(clock.read() == b'"');
+        let ts = clock.add(q);
+        let width = if ts.add(4).read() != b'-' { 13 }
+            else if ts.add(19).read() == b'Z' { 20 }
+            else { 25 };
+        let arrival = suffix(ts, width, q, b',');
+        if arrival.is_null() { return std::ptr::null(); }
+        let q = usize::from(arrival.read() == b'"');
+        let received = arrival.add(q);
+        let tail = suffix(received, 20, q, b',');
+        if tail.is_null() { return std::ptr::null(); }
+        let q = usize::from(tail.read() == b'"');
+        let kind = tail.add(q);
+        let kind_word = kind.cast::<u32>().read_unaligned();
+        if kind_word != u32::from_le_bytes(*b"view") && kind_word != u32::from_le_bytes(*b"cart") {
+            return std::ptr::null();
+        }
+        let product = suffix(kind, 4, q, b',');
+        if product.is_null() { return std::ptr::null(); }
+        let bytes = _mm256_loadu_si256(product.cast());
+        let mask = |c| _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(c))) as u32;
+        let lf = mask(b'\n' as i8);
+        if lf == 0 { return std::ptr::null(); }
+        let width_tail = lf.trailing_zeros();
+        // All earlier fields are proved below and cannot contain an LF.
+        let live = lf ^ lf.wrapping_sub(1);
+        let live = live >> 1;
+        let separators = mask(b',' as i8) & live;
+        let quote_bits = mask(b'"' as i8) & live;
+        let cut = separators.trailing_zeros();
+        let before = separators.wrapping_sub(1);
+        let product_quote = quote_bits & before;
+        let price_quote = quote_bits & !before & !separators;
+        if separators.count_ones() != 1 || cut == 0
+            || (product_quote != 0 && (cut < 3 || product_quote != (1 | 1 << (cut - 1))))
+            || (price_quote != 0 && (width_tail <= cut + 2
+                || price_quote != ((separators << 1) | (1 << (width_tail - 1)))))
+        {
+            return std::ptr::null();
+        }
+        let time = match width {
+            13 => stamp::<13>(ts, state.clock),
+            20 => stamp::<20>(ts, state.clock),
+            _ => stamp::<25>(ts, state.clock),
+        };
+        let day = state.clock.day(received);
+        let millis = hms::<true>(received);
+        if time == INVALID || day == INVALID || millis == INVALID
+            || received.add(10).read() != b'T' || received.add(19).read() != b'Z'
+        {
+            return std::ptr::null();
+        }
+        let arrived = day + millis;
+        let offset = arrived / 1000 - state.start / 1000 + ARRIVAL_BIAS;
+        if offset as u64 >= u64::from(SIDE) {
+            return std::ptr::null();
+        }
+        let valid = time >= state.start && time < state.end && time >= arrived - DAY;
+        emit.push(Candidate {
+            id: mix(id), user: if valid { mix(user) } else { 0 },
+            arrival: offset as u32, t: T::pack(if valid { time } else { INVALID }, state.start),
+        }, None);
+        product.add(width_tail as usize + 1)
+    }
+}
+
 #[target_feature(enable = "avx2")]
-unsafe fn event_cursors<const N: usize, const PREFIX: bool, T: EventTime>(
+unsafe fn event_cursors<const N: usize, const PREFIX: bool, const TAIL_SCAN: bool, T: EventTime>(
     data: &[u8],
     date: &mut Dates,
     keys: &Keys,
@@ -580,6 +659,14 @@ unsafe fn event_cursors<const N: usize, const PREFIX: bool, T: EventTime>(
                     continue;
                 }
                 active = true;
+                if TAIL_SCAN {
+                    let following = event_tail_scan::<T>(p, ends[i], state, emit);
+                    if !following.is_null() {
+                        count[0] += 1;
+                        cursor[i] = following;
+                        continue;
+                    }
+                }
                 let end = next_lf64(p, ends[i]);
                 let following = end.add(usize::from(end < ends[i]));
                 if limit.offset_from(p) >= 128
@@ -620,18 +707,21 @@ pub(super) fn events<T: EventTime>(
     // The caller has checked AVX2. Keep the probe checkpoints consistent.
     unsafe {
         if level == 7 {
+            if std::env::var_os("SHOPPING_LF_IN_TAIL").is_some() {
+                return event_cursors::<1, true, true, T>(data, date, keys, catalog, state, emit);
+            }
             if std::env::var_os("SHOPPING_MASKED_PREFIX").is_some() {
-                return event_cursors::<1, true, T>(data, date, keys, catalog, state, emit);
+                return event_cursors::<1, true, false, T>(data, date, keys, catalog, state, emit);
             }
             match std::env::var("SHOPPING_ROW_CURSORS").as_deref() {
                 Ok("1") => {
-                    return event_cursors::<1, false, T>(data, date, keys, catalog, state, emit);
+                    return event_cursors::<1, false, false, T>(data, date, keys, catalog, state, emit);
                 }
                 Ok("2") => {
-                    return event_cursors::<2, false, T>(data, date, keys, catalog, state, emit);
+                    return event_cursors::<2, false, false, T>(data, date, keys, catalog, state, emit);
                 }
                 Ok("3") => {
-                    return event_cursors::<3, false, T>(data, date, keys, catalog, state, emit);
+                    return event_cursors::<3, false, false, T>(data, date, keys, catalog, state, emit);
                 }
                 _ => {}
             }

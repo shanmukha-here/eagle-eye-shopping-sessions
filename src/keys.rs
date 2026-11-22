@@ -223,13 +223,14 @@ impl People {
             }
             table.table[i].0.store(key, Relaxed);
             table.table[i].1.store(name, Relaxed);
+            table.record_home(key);
         }
         table
     }
 }
 // Nonempty keys use zero as the empty slot sentinel. The parent stores a
 // slot index plus one, with zero identifying a root. Entries never move.
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
 #[derive(Default)]
 struct Vertex {
     key: AtomicU64,
@@ -326,7 +327,7 @@ impl Graph {
         let aliases = Aliases::empty(cap);
         std::thread::scope(|scope| {
             for (part, vertices) in self.0.chunks(block).enumerate() {
-                let table = &aliases.table;
+                let (table, alias) = (&aliases.table, &aliases);
                 scope.spawn(move || {
                     for (off, v) in vertices.iter().enumerate() {
                         if v.parent.load(Relaxed) == 0 {
@@ -343,6 +344,7 @@ impl Graph {
                             j = (j + 1) & (cap - 1);
                         }
                         table[j].1.store(name, Relaxed);
+                        alias.record_home(key);
                     }
                 });
             }
@@ -351,16 +353,52 @@ impl Graph {
     }
 }
 pub struct Aliases {
+    homes: Vec<AtomicU8>,
     table: Vec<(AtomicU64, AtomicU64)>,
 }
 impl Aliases {
     fn empty(n: usize) -> Self {
+        let length = if std::env::var_os("SHOPPING_ALIAS_FILTER").is_some() { n } else { 0 };
         Self {
+            homes: (0..length).map(|_| AtomicU8::new(0)).collect(),
             table: (0..n)
                 .map(|_| (AtomicU64::new(0), AtomicU64::new(0)))
                 .collect(),
         }
     }
+    #[inline(always)]
+    fn tag(key: Key) -> u8 {
+        1 << (key >> 49 & 7)
+    }
+
+    fn record_home(&self, key: Key) {
+        if !self.homes.is_empty() {
+            let mask = self.homes.len() - 1;
+            self.homes[key as usize & mask].fetch_or(Self::tag(key), Relaxed);
+        }
+    }
+
+    #[inline]
+    pub(super) fn prefetch_mask<T>(&self, records: &[T], key: impl Fn(&T) -> Key) -> u128 {
+        if self.homes.is_empty() {
+            for record in records {
+                self.prefetch(key(record));
+            }
+            return u128::MAX;
+        }
+        let mut need_alias = 0;
+        let mask = self.homes.len() - 1;
+        for (i, record) in records.iter().enumerate() {
+            let k = key(record);
+            let tagged = self.homes[k as usize & mask].load(Relaxed) & Self::tag(k) != 0;
+            if tagged {
+                self.prefetch(k);
+                need_alias |= 1u128 << i;
+            }
+        }
+        need_alias
+    }
+
     pub(crate) fn entries(&self) -> impl Iterator<Item = (Key, Key)> + '_ {
         self.table.iter().filter_map(|(key, name)| {
             let key = key.load(Relaxed);

@@ -5,6 +5,7 @@ mod compact;
 mod input;
 mod keys;
 mod output;
+mod pool;
 mod pages;
 mod raw;
 
@@ -339,10 +340,11 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
     let bias = start / 1000 - ARRIVAL_BIAS;
     for bin in parts {
         for block in bin.rows.chunks(group) {
-            for row in block {
-                people.prefetch(row.user);
-            }
+            let mut need_alias = people.prefetch_mask(block, |row| row.user);
             for &row in block {
+                let possible = need_alias & 1 != 0;
+                need_alias >>= 1;
+                let name = || if possible { people.canonical(row.user) } else { row.user };
                 let bit = (row.id >> 20) as usize & (bits - 1);
                 let repeat = if PAIRED_BITS {
                     collisions[bit / 32] & (2u64 << (2 * (bit % 32))) != 0
@@ -358,7 +360,7 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
                 let route = |u, t| E::encode(Event { u, t, cents: detail.cents, cat: detail.category }, start);
                 if !repeat {
                     if let Some(t) = row.t.unpack(start) {
-                        let u = people.canonical(row.user);
+                        let u = name();
                         out[u as usize & shard_mask].push(route(u, t));
                     }
                     continue;
@@ -382,9 +384,9 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
                     let u = if old != 0 {
                         let (shard, at) = Routes::index(old);
                         let previous = *out[shard][at].user();
-                        if previous == row.user { previous } else { people.canonical(row.user) }
+                        if previous == row.user { previous } else { name() }
                     } else {
-                        people.canonical(row.user)
+                        name()
                     };
                     let shard = u as usize & shard_mask;
                     let (previous, at) = if old == 0 { (usize::MAX, 0) } else { Routes::index(old) };
@@ -504,6 +506,14 @@ fn usage() -> (f64, f64, i64, i64, i64) {
     )
 }
 
+fn io_boundary() -> Option<u128> {
+    env::var_os("SHOPPING_IO_TRACE").map(|_| {
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+    })
+}
+fn io_mark(name: &str, value: u128) {
+    eprintln!("boundary={name} realtime_ns={value}");
+}
 fn main() {
     let data = PathBuf::from(env::var_os("DATA_DIR").unwrap_or_else(|| "/data".into()));
     let out = PathBuf::from(env::var_os("OUTPUT_DIR").unwrap_or_else(|| "/output".into()));
@@ -533,8 +543,13 @@ fn main() {
         }
         mark = Instant::now();
     };
-    let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(data.join("manifest.json")).unwrap()).unwrap();
+    let start_read = io_boundary();
+    let manifest_bytes = fs::read(data.join("manifest.json")).unwrap();
+    if let Some(begin) = start_read {
+        io_mark("manifest_read_begin", begin);
+        io_mark("manifest_read_end", io_boundary().unwrap());
+    }
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes).unwrap();
     let mut dates = Dates::new();
     let mut bound = |key: &str| {
         dates
@@ -563,6 +578,19 @@ fn main() {
     }
 }
 
+#[inline]
+fn route_clicks(people: &Aliases, clicks: &[Click], shards: &mut [Vec<Click>], group: usize) {
+    let mask = shards.len() - 1;
+    for block in clicks.chunks(group) {
+        let mut need_alias = people.prefetch_mask(block, |click| click.u);
+        for click in block {
+            let u = if need_alias & 1 != 0 { people.canonical(click.u) } else { click.u };
+            need_alias >>= 1;
+            shards[u as usize & mask].push(Click { u, ..*click });
+        }
+    }
+}
+
 fn pipeline<T: EventTime, E: Stored>(
     data: &Path,
     out: &Path,
@@ -579,7 +607,7 @@ fn pipeline<T: EventTime, E: Stored>(
     let n = ((raw.bytes() / (6 << 20)).max(1))
         .next_power_of_two()
         .min(4096);
-    let people = std::sync::OnceLock::new();
+    let people = std::sync::Mutex::new(None);
     let clock = raw::Calendar::new(start, end);
     let fast = raw::available() && env::var_os("SHOPPING_RAW_EVENTS").is_some();
     let raw_aux = fast && env::var_os("SHOPPING_RAW_NO_AUX").is_none();
@@ -598,11 +626,30 @@ fn pipeline<T: EventTime, E: Stored>(
     if !probe {
         tasks.push(Scan::Links);
     }
-    tasks.extend(raw.chunks().into_iter().map(Scan::Events));
     let click_input = Input::open_for_scan(&data.join("clicks"));
-    if !probe {
-        tasks.extend(click_input.chunks().into_iter().map(Scan::Clicks));
+    let early_clicks = env::var_os("SHOPPING_EARLY_CLICKS").is_some();
+    let interleave = env::var_os("SHOPPING_INTERLEAVE_CLICKS").is_some();
+    let person_shards = n.min(512);
+    let group = env::var("SHOPPING_PREFETCH_GROUP").ok()
+        .and_then(|value| value.parse::<usize>().ok()).unwrap_or(32).clamp(1, 128);
+    let mut click_chunks = click_input.chunks().into_iter();
+    for (i, chunk) in raw.chunks().into_iter().enumerate() {
+        tasks.push(Scan::Events(chunk));
+        if !probe && interleave && i & 3 == 3 {
+            if let Some(clicks) = click_chunks.next() {
+                tasks.push(Scan::Clicks(clicks));
+            }
+        }
     }
+    if !probe {
+        tasks.extend(click_chunks.map(Scan::Clicks));
+    }
+    let use_pool = env::var_os("SHOPPING_REUSE_THREADS").is_some();
+    std::thread::scope(|pool_scope| {
+        let pool = pool::Pool::new(pool_scope, threads, use_pool);
+        let (raw, click_input, keys, catalog, clock, people) =
+            (&raw, &click_input, &keys, &catalog, &clock, &people);
+        let expected = raw.bytes() / 64 / threads / n;
     let lanes = std::thread::scope(|scope| {
         let readers = threads.min(4);
         for lane in 0..readers {
@@ -613,11 +660,9 @@ fn pipeline<T: EventTime, E: Stored>(
                 clicks.prefetch(lane, readers);
             });
         }
-        jobs(
+        pool.jobs(
             tasks,
-            threads,
-            |_| {
-                let expected = raw.bytes() / 64 / threads / n;
+            move |_| {
                 (
                     Dates::new(),
                     (0..n)
@@ -629,9 +674,12 @@ fn pipeline<T: EventTime, E: Stored>(
                     input::ReadBuffer::new(),
                     Vec::<Vec<Click>>::new(),
                     [0usize; 2],
+                    columns::<Click>(person_shards),
+                    None::<std::sync::Arc<Aliases>>,
+                    0usize,
                 )
             },
-            |s, task| match task {
+            move |s, task| match task {
                 Scan::Events(chunk) => {
                     let data = chunk.read(&mut s.2);
                     if fast {
@@ -665,12 +713,26 @@ fn pipeline<T: EventTime, E: Stored>(
                         &mut pending,
                         raw_aux,
                     );
-                    s.3.push(pending);
+                    if early_clicks {
+                        if s.6.is_none() {
+                            s.6 = people.lock().unwrap().clone();
+                        }
+                        if let Some(aliases) = &s.6 {
+                            s.7 += pending.len();
+                            route_clicks(aliases, &pending, &mut s.5, group);
+                        } else {
+                            s.3.push(pending);
+                        }
+                    } else {
+                        s.3.push(pending);
+                    }
                 }
                 Scan::Links => {
-                    people.get_or_init(|| read_people(data, &keys, threads, raw_aux));
+                    let frozen = read_people(data, keys, threads, raw_aux);
+                    *people.lock().unwrap() = Some(std::sync::Arc::new(frozen));
                 }
             },
+            |_, state| state,
         )
     });
     if probe {
@@ -685,10 +747,14 @@ fn pipeline<T: EventTime, E: Stored>(
         eprintln!("probe=events fast={hit} fallback={miss} emitted={rows}");
         unsafe { libc::_exit(0) }
     }
-    let people = people.into_inner().unwrap();
+    let people = people.lock().unwrap().take().unwrap();
     let mut parts = columns(n);
     let mut pending = Vec::new();
-    for (_, lane, _, clicks, _) in lanes {
+    let mut pre_routed = Vec::with_capacity(lanes.len());
+    let mut earlier = 0;
+    for (_, lane, _, clicks, _, done, _, n_clicks) in lanes {
+        pre_routed.push(done);
+        earlier += n_clicks;
         pending.extend(clicks);
         for (part, bucket) in parts.iter_mut().zip(lane) {
             part.push(bucket);
@@ -696,12 +762,14 @@ fn pipeline<T: EventTime, E: Stored>(
     }
     // Every parser has joined. Release the input page tables while workers
     // reduce events, so the main thread need not unmap gigabytes at a barrier.
-    let release_inputs = std::thread::spawn(move || {
-        raw.release();
-        click_input.release();
+    let release_inputs = pool_scope.spawn(move || {
+        raw.release_pages();
+        click_input.release_pages();
     });
+    if early_clicks && env::var_os("SHOPPING_PHASE_USAGE").is_some() {
+        eprintln!("clicks routed in parse={earlier}");
+    }
     stage("event and click parsing, identity graph");
-    let person_shards = n.min(512);
     enum Work<T> {
         Copies(Vec<Bucket<T>>),
         Clicks(Vec<Click>),
@@ -709,8 +777,6 @@ fn pipeline<T: EventTime, E: Stored>(
     let mut copies = parts.into_iter();
     let mut chunks = pending.into_iter();
     let paired_bits = env::var_os("SHOPPING_PAIRED_BITS").is_some();
-    let group = env::var("SHOPPING_PREFETCH_GROUP").ok()
-        .and_then(|value| value.parse::<usize>().ok()).unwrap_or(32).clamp(1, 128);
     let mut tasks = Vec::with_capacity(copies.len() + chunks.len());
     while copies.len() != 0 || chunks.len() != 0 {
         if let Some(part) = copies.next() {
@@ -720,11 +786,10 @@ fn pipeline<T: EventTime, E: Stored>(
             tasks.push(Work::Clicks(chunk));
         }
     }
-    let lanes = input::jobs_finish(
+    let lanes = pool.jobs(
         tasks,
-        threads,
-        |_| (columns(person_shards), columns(person_shards), Routes::default()),
-        |s, task| match task {
+        move |_| (columns(person_shards), columns(person_shards), Routes::default()),
+        move |s, task| match task {
             Work::Copies(part) => {
                 if paired_bits {
                     winners::<T, E, true>(part, &people, &mut s.0, start, group, &mut s.2);
@@ -732,29 +797,18 @@ fn pipeline<T: EventTime, E: Stored>(
                     winners::<T, E, false>(part, &people, &mut s.0, start, group, &mut s.2);
                 }
             }
-            Work::Clicks(chunk) => {
-                for block in chunk.chunks(group) {
-                    for c in block {
-                        people.prefetch(c.u);
-                    }
-                    for c in block {
-                        let u = people.canonical(c.u);
-                        let shard = u as usize & (person_shards - 1);
-                        s.1[shard].push(Click { u, ..*c });
-                    }
-                }
-            }
+            Work::Clicks(chunk) => route_clicks(&people, &chunk, &mut s.1, group),
         },
         |_, (mut events, clicks, mut routes)| {
             routes.remove_retired(&mut events);
             (events, clicks)
         },
     );
-    let (events, clicks): (Vec<_>, Vec<_>) = lanes.into_iter().unzip();
+    let (events, mut clicks): (Vec<_>, Vec<_>) = lanes.into_iter().unzip();
+    clicks.extend(pre_routed);
     let event_parts = transpose(events, person_shards);
     let click_parts = transpose(clicks, person_shards);
     release_inputs.join().unwrap();
-    drop(people);
     stage("event dedup and click routing");
     let mut work: Vec<_> = event_parts.into_iter().zip(click_parts).collect();
     if env::var_os("SHOPPING_HEAVIEST_FIRST").is_some() {
@@ -762,18 +816,17 @@ fn pipeline<T: EventTime, E: Stored>(
             events.iter().map(Vec::len).sum::<usize>() + clicks.iter().map(Vec::len).sum::<usize>(),
         ));
     }
-    let partial = input::jobs_finish(
+    let partial = pool.jobs(
         work,
-        threads,
-        |i| {
+        move |i| {
             let mut totals = Totals::new(catalog.categories.len(), catalog.channels.len(), start, end);
             totals.writer = Some(output::UserWriter::open(
                 &out.join(format!("user_daily/part-{i}.parquet")), &catalog.categories, narrow, true,
             ));
             totals
         },
-        |local, (es, cs)| {
-            local.partition(&keys, es, cs);
+        move |local, (es, cs)| {
+            local.partition(keys, es, cs);
         },
         |_, mut totals| {
             totals.writer.take().unwrap().close();
@@ -781,7 +834,8 @@ fn pipeline<T: EventTime, E: Stored>(
         },
     );
     stage("person sorts, aggregation and user parquet");
-    finish(out, &catalog, partial, stage)
+    finish(out, catalog, partial, stage)
+    })
 }
 
 fn finish(
@@ -806,6 +860,9 @@ fn finish(
         all,
         &catalog.channels,
     );
+    if let Some(after) = io_boundary() {
+        io_mark("last_parquet_write_returned", after);
+    }
     stage("parquet");
     // Both Parquet footers have been closed and all output workers joined.
     unsafe extern "C" {

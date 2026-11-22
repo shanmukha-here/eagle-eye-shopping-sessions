@@ -57,6 +57,9 @@ pub struct Input {
     read_ahead: usize,
     release_window: usize,
     step: usize,
+    populate_chunks: bool,
+    large_first: bool,
+    stripe: usize,
 }
 
 const STEP: usize = 2 << 20;
@@ -127,14 +130,27 @@ impl Input {
             vec![path.to_owned()]
         };
         paths.sort_unstable();
+        let strategy = std::env::var("SHOPPING_MAP_POLICY").unwrap_or_default();
+        let huge = scan && strategy == "huge";
+        let populate = scan && strategy == "populate";
+        let populate_chunks = scan && strategy == "parallel";
+        let stripe = if scan { mib("SHOPPING_INPUT_STRIPE_MIB", 0) } else { 0 };
+        let large_first = scan && (stripe != 0 || std::env::var_os("SHOPPING_INPUT_LARGE_FIRST").is_some());
         let mut mappings = Vec::with_capacity(paths.len());
         for path in paths {
             let file = File::open(path).unwrap();
             if file.metadata().unwrap().len() != 0 {
                 // The scorer mounts immutable input files.
-                let mapping = unsafe { Mmap::map(&file).unwrap() };
+                let mut options = memmap2::MmapOptions::new();
+                if populate {
+                    options.populate();
+                }
+                let mapping = unsafe { options.map(&file).unwrap() };
                 mappings.push((file, mapping));
             }
+        }
+        if large_first {
+            mappings.sort_by_key(|(_, map)| std::cmp::Reverse(map.len()));
         }
         let cold = scan
             && mappings.iter().max_by_key(|(_, map)| map.len())
@@ -152,6 +168,9 @@ impl Input {
         Self {
             files: mappings.into_iter().map(|(file, mapping)| {
                 let _ = mapping.advise(memmap2::Advice::Sequential);
+                if huge || (scan && cold && strategy == "huge-cold") {
+                    let _ = mapping.advise(memmap2::Advice::HugePage);
+                }
                 let buffered = (buffered_step != 0).then(|| {
                     unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
                     file
@@ -160,7 +179,16 @@ impl Input {
             }).collect(),
             read_ahead,
             release_window: mib("SHOPPING_RELEASE_MIB", 8),
-            step: if buffered_step == 0 { STEP } else { buffered_step },
+            step: if buffered_step == 0 && scan {
+                mib("SHOPPING_CHUNK_MIB", STEP >> 20).max(1 << 20)
+            } else if buffered_step == 0 {
+                STEP
+            } else {
+                buffered_step
+            },
+            populate_chunks,
+            large_first,
+            stripe,
         }
     }
 
@@ -169,10 +197,14 @@ impl Input {
     }
 
     pub fn release(self) {
+        self.release_pages();
+    }
+
+    pub fn release_pages(&self) {
         // Clear private page-table entries in smaller ranges to limit how
         // long the process's mapping lock is held while reducers run.
         let window = self.release_window;
-        for source in self.files {
+        for source in &self.files {
             let file = &source.mapping;
             if window != 0 && source.buffered.is_none() && file.len() > window {
                 for off in (0..file.len()).step_by(window) {
@@ -209,15 +241,26 @@ impl Input {
     }
 
     pub fn chunks(&self) -> Vec<Chunk<'_>> {
-        self.files.iter().flat_map(|source| {
+        let mut chunks: Vec<_> = self.files.iter().flat_map(|source| {
             let file = &source.mapping;
             (0..file.len()).step_by(self.step).map(|start| Chunk {
                 file,
                 buffered: source.buffered.as_ref(),
                 start,
+                populate: self.populate_chunks,
                 end: (start + self.step).min(file.len()),
             })
-        }).collect()
+        }).collect();
+        if self.stripe != 0 {
+            chunks.sort_by_key(|chunk| (
+                chunk.start / self.stripe,
+                std::cmp::Reverse(chunk.file.len()),
+                chunk.start,
+            ));
+        } else if self.large_first {
+            chunks.sort_by_key(|chunk| std::cmp::Reverse(chunk.end - chunk.start));
+        }
+        chunks
     }
 }
 
@@ -227,6 +270,7 @@ pub struct Chunk<'a> {
     buffered: Option<&'a File>,
     start: usize,
     end: usize,
+    populate: bool,
 }
 impl<'a> Chunk<'a> {
     pub fn read<'b>(&'b self, buf: &'b mut ReadBuffer) -> &'b [u8] {
@@ -248,6 +292,15 @@ impl<'a> Chunk<'a> {
     }
 
     pub fn records(self) -> &'a [u8] {
+        if self.populate {
+            // The mapping base and chunk starts are page-aligned. The tail
+            // can be short because the kernel rounds the advised size up.
+            let range = &self.file[self.start..self.end];
+            unsafe {
+                let _ = libc::madvise(range.as_ptr().cast_mut().cast(), range.len(),
+                                      libc::MADV_POPULATE_READ);
+            }
+        }
         owned_records(&self.file[self.start..], self.end - self.start, true).unwrap()
     }
 }
@@ -724,6 +777,7 @@ mod tests {
                     .flat_map(|start| {
                         Chunk {
                             buffered: None,
+                            populate: false,
                             file,
                             start,
                             end: (start + step).min(file.len()),

@@ -97,6 +97,9 @@ pub struct Totals {
     active: Vec<u32>,
     positions: Vec<usize>,
     bins: SessionBins,
+    coarse_min: usize,
+    coarse_bins: SessionBins,
+    single_max: usize,
 }
 #[derive(Clone, Copy, Default)]
 struct IndexSlot {
@@ -208,6 +211,8 @@ const GAP: u32 = 1_800_000;
 const BIN_BITS: u32 = 20;
 const BIN_THRESHOLD: usize = 256;
 const N_BINS: usize = 1 << (32 - BIN_BITS);
+const COARSE_WIDTH: u32 = 7_200_000;
+const COARSE_COUNT: usize = (u32::MAX / COARSE_WIDTH) as usize + 1;
 
 #[derive(Clone, Copy)]
 struct SessionBin {
@@ -267,6 +272,11 @@ impl Totals {
             active: Vec::new(),
             positions: vec![0; camps],
             bins: SessionBins::default(),
+            coarse_bins: SessionBins::default(),
+            single_max: std::env::var("SHOPPING_CERT_SESSION_MAX").ok()
+                .and_then(|n| n.parse().ok()).unwrap_or(0).min(64),
+            coarse_min: std::env::var("SHOPPING_COARSE_MIN").ok()
+                .and_then(|n| n.parse().ok()).unwrap_or(usize::MAX).max(2),
         }
     }
     pub fn days(self) -> BTreeMap<i32, Vec<Stats>> {
@@ -410,29 +420,113 @@ impl Totals {
             stats[c as usize].assists += 1;
         }
     }
-    fn person_binned<M: Observation>(
+    fn single_session<M: Observation>(&mut self, keys: &Keys, user: Key, events: &[M], clicks: &[Touch]) -> bool {
+        let mut first = events[0].time(self.origin);
+        let mut last = first;
+        for &event in &events[1..] {
+            let time = event.time(self.origin);
+            first = first.min(time);
+            last = last.max(time);
+            if last - first > i64::from(GAP) {
+                return false;
+            }
+        }
+        // All observed times are within one session gap, so sorting cannot
+        // reveal an internal break and the minimum gives the exact start.
+        let mut revenue = 0;
+        for &event in events {
+            let cents = i64::from(event.cents());
+            if cents != 0 {
+                let category = event.category();
+                let sum = &mut self.category_cents[category as usize];
+                if *sum == 0 {
+                    self.touched.push(category);
+                }
+                *sum += cents;
+                revenue += cents;
+            }
+        }
+        let day = first.div_euclid(DAY) as i32;
+        let mut best = None::<Touch>;
+        for &click in clicks {
+            if click.t < first - WEEK || click.t > first {
+                continue;
+            }
+            let seen = &mut self.counts[click.campaign as usize];
+            if *seen == 0 {
+                *seen = 1;
+                self.active.push(click.campaign);
+            }
+            if best.is_none_or(|previous|
+                click.t > previous.t || (click.t == previous.t && keys.cmp(click.id, previous.id).is_lt())
+            ) {
+                best = Some(click);
+            }
+        }
+        let stats = if !self.dense_days.is_empty() {
+            let stats = &mut self.dense_days[(day - self.base_day) as usize];
+            if stats.is_empty() {
+                stats.resize(self.counts.len(), Stats::default());
+            }
+            stats
+        } else {
+            self.campaigns.entry(day).or_insert_with(|| vec![Stats::default(); self.counts.len()])
+        };
+        let credit = best.map_or(0, |click| click.campaign as usize);
+        stats[credit].sessions += 1;
+        stats[credit].buying += i64::from(revenue > 0);
+        stats[credit].revenue += revenue;
+        for &c in &self.active {
+            stats[c as usize].assists += 1;
+        }
+        self.finish_day(UserRow {
+            u: user, day, sessions: 1, events: events.len() as i64, revenue, top: None,
+        }, keys);
+        for channel in self.active.drain(..) {
+            self.counts[channel as usize] = 0;
+        }
+        true
+    }
+
+    fn person_binned<M: Observation, const COARSE: bool>(
         &mut self,
         keys: &Keys,
         u: Key,
         events: &[M],
         clicks: &[Touch],
-    ) {
-        let mut scratch = std::mem::take(&mut self.bins);
-        scratch.bins.resize(N_BINS, SessionBin::default());
+    ) -> bool {
+        let mut scratch = std::mem::take(if COARSE { &mut self.coarse_bins } else { &mut self.bins });
+        let count = if COARSE { COARSE_COUNT } else { N_BINS };
+        scratch.bins.resize(count, SessionBin::default());
         scratch.purchased.clear();
         // Each interval is shorter than the session gap, so all of its
         // events are connected without sorting. Adjacent occupied intervals
         // connect exactly when their nearest observed times are within GAP.
-        let mut present = [0u64; N_BINS / 64];
+        let mut bit_storage = [0u64; N_BINS / 64];
+        let present = &mut bit_storage[..count.div_ceil(64)];
         let origin = self.origin;
         for &event in events {
             let time = (event.time(origin) - origin) as u32;
-            let index = (time >> BIN_BITS) as usize;
+            let index = if COARSE { time / COARSE_WIDTH } else { time >> BIN_BITS } as usize;
             let bin = &mut scratch.bins[index];
             bin.first = bin.first.min(time);
             bin.last = bin.last.max(time);
             bin.count += 1;
             present[index >> 6] |= 1 << (index & 63);
+            if COARSE && bin.last - bin.first > GAP {
+                // A range wider than GAP has no connectivity proof. Reset
+                // this person's scratch and use the existing exact path.
+                for (word, &bits) in present.iter().enumerate() {
+                    let mut live = bits;
+                    while live != 0 {
+                        let at = word * 64 + live.trailing_zeros() as usize;
+                        scratch.bins[at] = SessionBin::default();
+                        live &= live - 1;
+                    }
+                }
+                self.coarse_bins = scratch;
+                return false;
+            }
             if event.cents() != 0 {
                 scratch
                     .purchased
@@ -455,7 +549,8 @@ impl Totals {
             last_time: i64::MIN,
             ..Window::default()
         };
-        for (upper, mut bits) in present.into_iter().enumerate() {
+        for (upper, &bits) in present.iter().enumerate() {
+            let mut bits = bits;
             while bits != 0 {
                 let index = upper * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
@@ -514,7 +609,8 @@ impl Totals {
         for c in self.active.drain(..) {
             self.counts[c as usize] = 0;
         }
-        self.bins = scratch;
+        if COARSE { self.coarse_bins = scratch; } else { self.bins = scratch; }
+        true
     }
 
     pub(crate) fn partition_dense(
@@ -744,9 +840,16 @@ impl Totals {
         for (user, end_e, end_c) in groups {
             let events = &mut es[e..end_e];
             let clicks = &mut cs[c..end_c];
-            clicks.sort_unstable_by_key(|click| click.t);
-            if self.packed && (BIN_THRESHOLD..=u32::MAX as usize).contains(&events.len()) {
-                self.person_binned(keys, user, events, clicks);
+            let single = events.len() <= self.single_max && self.single_session(keys, user, events, clicks);
+            if !single {
+                clicks.sort_unstable_by_key(|click| click.t);
+            }
+            let coarse = !single && self.packed && (self.coarse_min..=u32::MAX as usize).contains(&events.len())
+                && self.person_binned::<M, true>(keys, user, events, clicks);
+            if single || coarse {
+                // The range proof already emitted the complete group.
+            } else if self.packed && (BIN_THRESHOLD..=u32::MAX as usize).contains(&events.len()) {
+                self.person_binned::<M, false>(keys, user, events, clicks);
             } else {
                 M::order(events);
                 self.person(keys, user, events, clicks);

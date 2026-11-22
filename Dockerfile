@@ -8,5 +8,6 @@ RUN cargo build -j 4 --release --locked --target x86_64-unknown-linux-gnu && str
 FROM scratch
 COPY --from=build /src/target/x86_64-unknown-linux-gnu/release/shopping-sessions /shopping-sessions
 ENV SHOPPING_RAW_EVENTS=1 SHOPPING_MASKED_PREFIX=1 SHOPPING_HEAVIEST_FIRST=1
+ENV SHOPPING_REUSE_THREADS=1 SHOPPING_ALIAS_FILTER=1 SHOPPING_EARLY_CLICKS=1 SHOPPING_LF_IN_TAIL=1 SHOPPING_MAP_POLICY=huge-cold
 USER 1000:1000
 ENTRYPOINT ["/shopping-sessions"]

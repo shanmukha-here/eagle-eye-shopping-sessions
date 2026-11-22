@@ -815,6 +815,7 @@ mod tests {
                             buffered: None,
                             populate: false,
                             file,
+                            file_index: 0,
                             start,
                             end: (start + step).min(file.len()),
                         }
@@ -826,6 +827,23 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn mapped_fields_keep_width_and_offset_without_truncation() {
+        let file = b"unquoted,opaque-name-with-a-long-suffix\n";
+        let source = FieldSource { file, index: 8191 };
+        let field = &file[9..file.len() - 1];
+        let handle = source.field_handle(field).unwrap();
+        assert_eq!(handle >> 48, 8191);
+        assert_eq!((handle >> 16) as u32, 9);
+        assert_eq!(handle as u16 as usize, field.len());
+        assert!(FieldSource { file, index: 8192 }.field_handle(field).is_none());
+        assert!(source.field_handle(b"a string outside the mapping").is_none());
+
+        let wide = vec![b'x'; usize::from(u16::MAX) + 1];
+        let source = FieldSource { file: &wide, index: 0 };
+        assert!(source.field_handle(&wide).is_none());
+    }
+
     #[test]
     fn bounded_reads_preserve_long_boundary_rows_and_eof() {
         let mut bytes = b"header\n".to_vec();

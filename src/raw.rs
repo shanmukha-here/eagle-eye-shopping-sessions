@@ -1074,12 +1074,13 @@ unsafe fn click(
     catalog: &Catalog,
     out: &mut Vec<Click>,
     source: Option<crate::input::FieldSource<'_>>,
+    users: &mut LongUsers,
 ) -> bool {
     unsafe {
         let (mut id, mut user) = (0, 0);
         let campaign = two_ids::<true, true>(p, b',', &mut id, &mut user);
         if campaign.is_null() {
-            return click_opaque_tail(p, end, limit, state, keys, catalog, out, source);
+            return click_opaque_tail(p, end, limit, state, keys, catalog, out, source, users);
         }
         let Some((time, code)) = click_tail(campaign, end, state, catalog) else {
             return false;
@@ -1106,6 +1107,7 @@ unsafe fn click_opaque_tail(
     catalog: &Catalog,
     out: &mut Vec<Click>,
     source: Option<crate::input::FieldSource<'_>>,
+    users: &mut LongUsers,
 ) -> bool {
     unsafe {
         let Some((id, next)) = read_opaque_id(p, limit) else { return false; };
@@ -1114,14 +1116,48 @@ unsafe fn click_opaque_tail(
             return false;
         };
         if time >= state.start - WEEK && time < state.end {
+            let long = user.len() > 9;
             out.push(Click {
-                u: mix(keys.key(user)),
+                u: if long { 0 } else { mix(keys.key(user)) },
                 t: time,
                 id: keys.click_key(id, source),
                 campaign: code,
             });
+            if long {
+                users.defer(out.len() - 1, user, keys, out);
+            }
         }
         true
+    }
+}
+
+// Long click users wait here for a batched name-table lookup, as in the
+// event store. Spans point into the chunk being parsed.
+pub(super) struct LongUsers(Vec<(usize, u64, Ptr, usize)>);
+
+impl LongUsers {
+    const BATCH: usize = 32;
+
+    #[inline(always)]
+    unsafe fn defer(&mut self, row: usize, user: &[u8], keys: &Keys, out: &mut [Click]) {
+        let hash = crate::opaque_names::hash(user);
+        keys.prefetch_slot(hash);
+        self.0.push((row, hash, user.as_ptr(), user.len()));
+        if self.0.len() == Self::BATCH {
+            unsafe { self.resolve(keys, out) };
+        }
+    }
+
+    #[inline(never)]
+    unsafe fn resolve(&mut self, keys: &Keys, out: &mut [Click]) {
+        for &(_, hash, _, _) in &self.0 {
+            keys.prefetch_name(hash);
+        }
+        for &(row, hash, name, len) in &self.0 {
+            let name = unsafe { std::slice::from_raw_parts(name, len) };
+            out[row].u = mix(keys.intern_hashed(name, hash));
+        }
+        self.0.clear();
     }
 }
 
@@ -1158,18 +1194,20 @@ unsafe fn click_loop(
     unsafe {
         let limit = data.as_ptr().add(data.len());
         let mut p = data.as_ptr();
+        let mut users = LongUsers(Vec::with_capacity(LongUsers::BATCH));
         while p < limit {
             let end = next_lf(p, limit);
             let next = end.add(usize::from(end < limit));
             if limit.offset_from(p) < 128
                 || end.offset_from(p) < 32
-                || !click(p, end, limit, state, keys, catalog, out, source)
+                || !click(p, end, limit, state, keys, catalog, out, source, &mut users)
             {
                 let row = std::slice::from_raw_parts(p, next.offset_from(p) as usize);
                 crate::clicks(row, date, keys, catalog, state.start, state.end, out, source);
             }
             p = next;
         }
+        users.resolve(keys, out);
     }
 }
 

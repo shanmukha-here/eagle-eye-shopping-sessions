@@ -275,8 +275,10 @@ impl Totals {
             coarse_bins: SessionBins::default(),
             single_max: std::env::var("SHOPPING_CERT_SESSION_MAX").ok()
                 .and_then(|n| n.parse().ok()).unwrap_or(0).min(64),
+            // Every group of two or more events first tries the sort-free
+            // two-hour interval proof; groups it cannot prove fall back.
             coarse_min: std::env::var("SHOPPING_COARSE_MIN").ok()
-                .and_then(|n| n.parse().ok()).unwrap_or(usize::MAX).max(2),
+                .and_then(|n| n.parse().ok()).unwrap_or(2).max(2),
         }
     }
     pub fn days(self) -> BTreeMap<i32, Vec<Stats>> {

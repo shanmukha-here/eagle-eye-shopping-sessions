@@ -373,6 +373,8 @@ struct State<'a> {
     clock: &'a Calendar,
     start: i64,
     end: i64,
+    catalog: &'a Catalog,
+    keys: &'a Keys,
 }
 
 #[inline(always)]
@@ -625,7 +627,7 @@ unsafe fn event_tail_scan<T: EventTime>(
             user: if valid { mix(user) } else { 0 },
             arrival: tail.offset,
             t: T::pack(if valid { tail.time } else { INVALID }, state.start),
-        }, None);
+        }, tail.sale(valid));
         tail.next
     }
 }
@@ -635,6 +637,10 @@ struct CheckedEventTail {
     arrival_ms: i64,
     offset: u32,
     next: Ptr,
+    // Purchase price, or zero for a view or cart. A purchase with an
+    // invalid price carries an invalid time, which makes the copy invalid.
+    cents: u32,
+    category: u32,
 }
 
 impl CheckedEventTail {
@@ -642,12 +648,56 @@ impl CheckedEventTail {
     fn in_window(&self, state: State<'_>) -> bool {
         self.time >= state.start && self.time < state.end && self.time >= self.arrival_ms - DAY
     }
+
+    /// The side record of a valid purchase, as the exact reader stores it.
+    #[inline(always)]
+    fn sale(&self, valid: bool) -> Option<Detail> {
+        (valid && self.cents != 0).then(|| Detail {
+            arrival: self.arrival_ms / 1000,
+            cents: self.cents,
+            category: self.category,
+            opaque: None,
+        })
+    }
+}
+
+/// Digits only, 1 to 10,000,000, as `input::decimal` with the nonzero rule.
+/// Zero means an invalid price. Longer spellings, which can only be valid
+/// with leading zeros, return None for the exact reader.
+#[inline(always)]
+unsafe fn price(p: Ptr, len: usize) -> Option<u32> {
+    unsafe {
+        if len > 8 {
+            return None;
+        }
+        let mut value = 0u32;
+        for i in 0..len {
+            let d = p.add(i).read().wrapping_sub(b'0');
+            if d > 9 {
+                return Some(0);
+            }
+            value = value * 10 + u32::from(d);
+        }
+        Some(if value > 10_000_000 { 0 } else { value })
+    }
 }
 
 // The tail reads at most 90 bytes after the first timestamp, including the
 // unaligned vector containing its row ending.
 #[inline(always)]
 unsafe fn checked_event_tail(clock: Ptr, limit: Ptr, state: State<'_>) -> Option<CheckedEventTail> {
+    unsafe { event_tail_body::<false>(clock, limit, state) }
+}
+
+// Purchases take their own instance, so price and category code stays out
+// of the view and cart path.
+#[inline(never)]
+unsafe fn purchase_tail(clock: Ptr, limit: Ptr, state: State<'_>) -> Option<CheckedEventTail> {
+    unsafe { event_tail_body::<true>(clock, limit, state) }
+}
+
+#[inline(always)]
+unsafe fn event_tail_body<const PURCHASE: bool>(clock: Ptr, limit: Ptr, state: State<'_>) -> Option<CheckedEventTail> {
     unsafe {
         if limit.offset_from(clock) < 96 {
             return None;
@@ -666,10 +716,16 @@ unsafe fn checked_event_tail(clock: Ptr, limit: Ptr, state: State<'_>) -> Option
         let q = usize::from(tail.read() == b'"');
         let kind = tail.add(q);
         let kind_word = kind.cast::<u32>().read_unaligned();
-        if kind_word != u32::from_le_bytes(*b"view") && kind_word != u32::from_le_bytes(*b"cart") {
-            return None;
+        if PURCHASE {
+            if kind_word != u32::from_le_bytes(*b"purc")
+                || kind.add(4).cast::<u32>().read_unaligned() != u32::from_le_bytes(*b"hase")
+            {
+                return None;
+            }
+        } else if kind_word != u32::from_le_bytes(*b"view") && kind_word != u32::from_le_bytes(*b"cart") {
+            return if kind_word == u32::from_le_bytes(*b"purc") { purchase_tail(clock, limit, state) } else { None };
         }
-        let product = suffix(kind, 4, q, b',');
+        let product = suffix(kind, if PURCHASE { 8 } else { 4 }, q, b',');
         if product.is_null() { return None; }
         let bytes = _mm256_loadu_si256(product.cast());
         let mask = |c| _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(c))) as u32;
@@ -722,11 +778,25 @@ unsafe fn checked_event_tail(clock: Ptr, limit: Ptr, state: State<'_>) -> Option
         if offset as u64 >= u64::from(SIDE) {
             return None;
         }
+        let (mut cents, mut category) = (0, 0);
+        if PURCHASE {
+            // The masks above proved both field spans and their quotes.
+            let (cut, width_tail) = (cut as usize, width_tail as usize);
+            let quoted = usize::from(price_quote != 0);
+            cents = price(product.add(cut + 1 + quoted), width_tail - cut - 1 - 2 * quoted)?;
+            if cents != 0 {
+                let quoted = usize::from(product_quote != 0);
+                let name = std::slice::from_raw_parts(product.add(quoted), cut - 2 * quoted);
+                category = state.catalog.products.get(state.keys, name).unwrap_or(state.catalog.unknown);
+            }
+        }
         Some(CheckedEventTail {
-            time,
+            time: if PURCHASE && cents == 0 { INVALID } else { time },
             arrival_ms: arrived,
             offset: offset as u32,
             next: product.add(width_tail as usize + 1),
+            cents,
+            category,
         })
     }
 }
@@ -794,16 +864,17 @@ unsafe fn event_opaque_tail<T: EventTime>(
             arrival: tail.offset,
             t: T::pack(if valid { tail.time } else { INVALID }, state.start),
         };
+        let sale = tail.sale(valid);
         if id.len() > 9 {
-            emit.push_opaque(row, Detail {
+            emit.push_opaque(row, sale.unwrap_or(Detail {
                 arrival: tail.arrival_ms / 1000,
                 cents: 0,
                 category: 0,
                 opaque: None,
-            }, id, keys);
+            }), id, keys);
         } else {
             row.id = mix(keys.key(id));
-            emit.push(row, None);
+            emit.push(row, sale);
         }
         tail.next
     }
@@ -883,7 +954,7 @@ pub(super) fn events<T: EventTime>(
     level: usize,
     count_rows: bool,
 ) -> [usize; 2] {
-    let state = State { clock, start, end };
+    let state = State { clock, start, end, catalog, keys };
     // The caller has checked AVX2. Keep the probe checkpoints consistent.
     unsafe {
         if level == 7 {
@@ -1062,7 +1133,7 @@ pub(super) fn clicks(
 ) {
     if fast {
         // The caller selected AVX2 before enabling this scanner.
-        unsafe { click_loop(data, date, keys, catalog, State { start, end, clock }, out, source) }
+        unsafe { click_loop(data, date, keys, catalog, State { start, end, clock, catalog, keys }, out, source) }
     } else {
         crate::clicks(data, date, keys, catalog, start, end, out, source);
     }

@@ -319,7 +319,7 @@ impl People {
 }
 // Nonempty keys use zero as the empty slot sentinel. The parent stores a
 // slot index plus one, with zero identifying a root. Entries never move.
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 /// `n` values from zeroed allocator memory. Fresh pages arrive zero-filled
 /// on first touch, so no thread writes the defaults in a serial pass.
 ///
@@ -464,12 +464,19 @@ impl Graph {
     }
 }
 pub struct Aliases {
-    homes: Vec<AtomicU8>,
+    // A blocked Bloom filter of the alias keys: two bits in one word per key.
+    homes: Vec<AtomicU64>,
     table: Vec<(AtomicU64, AtomicU64)>,
 }
+
+// One filter word per 32 table slots holds 8-16 keys at the table's 25-50%
+// load: about 3-15% false positives (6% at 60M events) in a 2 MB filter at
+// 60M, small enough to stay cached beside the streaming rows.
+const FILTER_SLOTS: usize = 32;
+
 impl Aliases {
     fn empty(n: usize) -> Self {
-        let length = if std::env::var_os("SHOPPING_ALIAS_FILTER").is_some() { n } else { 0 };
+        let length = if std::env::var_os("SHOPPING_ALIAS_FILTER").is_some() { (n / FILTER_SLOTS).max(1) } else { 0 };
         // Zero atomics are the empty filter and empty slots.
         Self {
             homes: if length == 0 { Vec::new() } else { unsafe { zeroed(length) } },
@@ -477,8 +484,8 @@ impl Aliases {
         }
     }
     #[inline(always)]
-    fn tag(key: Key) -> u8 {
-        1 << (key >> 49 & 7)
+    fn tag(key: Key) -> u64 {
+        1 << (key >> 52 & 63) | 1 << (key >> 58)
     }
 
     fn record_home(&self, key: Key) {
@@ -500,7 +507,8 @@ impl Aliases {
         let mask = self.homes.len() - 1;
         for (i, record) in records.iter().enumerate() {
             let k = key(record);
-            let tagged = self.homes[k as usize & mask].load(Relaxed) & Self::tag(k) != 0;
+            let tag = Self::tag(k);
+            let tagged = self.homes[k as usize & mask].load(Relaxed) & tag == tag;
             // Keys pass the filter at random. An untagged key
             // prefetches slot zero, which stays cached, instead of branching.
             self.prefetch(if tagged { k } else { 0 });

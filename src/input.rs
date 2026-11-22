@@ -5,7 +5,7 @@ use std::{
     fs::{self, File},
     path::Path,
     sync::Mutex,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 pub fn jobs<T: Send, R: Send>(
@@ -63,6 +63,11 @@ pub struct Input {
 }
 
 const STEP: usize = 2 << 20;
+
+/// Set when huge pages are off for lack of memory. Huge-page advice on a
+/// cold mapping then lets Linux drop much of the input from the page cache,
+/// so cold scans read through buffers and keep it cached for the next run.
+pub static TIGHT_MEMORY: AtomicBool = AtomicBool::new(false);
 const OVERLAP: usize = 4096;
 
 pub struct ReadBuffer(Option<memmap2::MmapMut>);
@@ -165,7 +170,7 @@ impl Input {
             && mappings.iter().max_by_key(|(_, map)| map.len())
                 .is_some_and(|(_, map)| is_cold(map));
         let buffered_step = if scan && (cold || std::env::var_os("SHOPPING_BUFFER_ALWAYS").is_some()) {
-            mib("SHOPPING_BUFFER_MIB", 0)
+            mib("SHOPPING_BUFFER_MIB", if TIGHT_MEMORY.load(Ordering::Relaxed) { 8 } else { 0 })
         } else {
             0
         };

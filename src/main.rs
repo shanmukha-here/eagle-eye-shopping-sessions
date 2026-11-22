@@ -1047,6 +1047,7 @@ fn huge_page_policy(input_bytes: usize) {
         // Affects every later fault of this process, including mappings
         // already advised for huge pages.
         unsafe { libc::prctl(libc::PR_SET_THP_DISABLE, 1, 0, 0, 0) };
+        input::TIGHT_MEMORY.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     if env::var_os("SHOPPING_PHASE_USAGE").is_some() {
         eprintln!("huge pages {} for {input_bytes} input bytes, {room:?} available", if off { "off" } else { "on" });

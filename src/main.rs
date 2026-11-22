@@ -923,14 +923,11 @@ fn main() {
     let (start, end) = (bound("window_start"), bound("window_end"));
     fs::create_dir_all(out.join("user_daily")).unwrap();
     fs::create_dir_all(out.join("campaign_daily")).unwrap();
-    let event_bytes = fs::read_dir(data.join("events")).unwrap().map(|entry| {
-        let entry = entry.unwrap();
-        if entry.path().extension().is_some_and(|extension| extension == "csv") {
-            entry.metadata().unwrap().len() as usize
-        } else {
-            0
-        }
-    }).sum();
+    let event_bytes = csv_bytes(&data.join("events"));
+    // Only the 32-bit clock layout is reserved ahead; the parser checks the
+    // type and the sizes before it takes a reservation.
+    let prepared = (end.saturating_sub(start) <= u32::MAX as i64)
+        .then(|| Prepared::spawn::<u32>(event_bytes, csv_bytes(&data.join("clicks")), threads));
     let mut keys = Keys::with_event_bytes(event_bytes);
     let catalog = Catalog::read(&data, &keys);
     if env::var_os("SHOPPING_DEFER_CLICK_IDS").is_some() {
@@ -944,12 +941,12 @@ fn main() {
     }
     if end.saturating_sub(start) <= u32::MAX as i64 {
         if catalog.categories.len() <= 256 {
-            pipeline::<u32, SmallEvent>(&data, &out, threads, start, end, keys, catalog, stage);
+            pipeline::<u32, SmallEvent>(&data, &out, threads, start, end, keys, catalog, prepared, stage);
         } else {
-            pipeline::<u32, Event>(&data, &out, threads, start, end, keys, catalog, stage);
+            pipeline::<u32, Event>(&data, &out, threads, start, end, keys, catalog, prepared, stage);
         }
     } else {
-        pipeline::<i64, Event>(&data, &out, threads, start, end, keys, catalog, stage);
+        pipeline::<i64, Event>(&data, &out, threads, start, end, keys, catalog, prepared, stage);
     }
 }
 
@@ -966,7 +963,88 @@ fn route_clicks(people: &Aliases, clicks: &[Click], shards: &mut [Vec<Click>], g
     }
 }
 
-fn pipeline<T: EventTime, E: Stored + 'static>(
+fn csv_bytes(folder: &Path) -> usize {
+    fs::read_dir(folder).unwrap().map(|entry| {
+        let entry = entry.unwrap();
+        if entry.path().extension().is_some_and(|extension| extension == "csv") {
+            entry.metadata().unwrap().len() as usize
+        } else {
+            0
+        }
+    }).sum()
+}
+
+fn bucket_count(event_bytes: usize) -> usize {
+    let bucket_bytes = env::var("SHOPPING_BUCKET_KB").ok()
+        .and_then(|value| value.parse::<usize>().ok()).unwrap_or(6 << 10) << 10;
+    ((event_bytes / bucket_bytes).max(1)).next_power_of_two().min(4096)
+}
+
+fn person_shard_count(buckets: usize) -> usize {
+    buckets.min(env::var("SHOPPING_PERSON_SHARDS").ok()
+        .and_then(|value| value.parse::<usize>().ok()).unwrap_or(512).next_power_of_two())
+}
+
+/// Per-worker parse reservations: event buckets and routed click shards.
+#[derive(Clone, Copy, PartialEq)]
+struct Layout {
+    buckets: usize,
+    rows: usize,
+    shards: usize,
+    clicks: usize,
+}
+
+impl Layout {
+    fn new(event_bytes: usize, click_bytes: usize, threads: usize) -> Self {
+        let buckets = bucket_count(event_bytes);
+        Self {
+            buckets,
+            rows: event_bytes / 64 / threads / buckets,
+            shards: person_shard_count(buckets),
+            // Generated click rows average more than 50 bytes.
+            clicks: click_bytes / 50 / threads,
+        }
+    }
+
+    fn reserve<T>(self) -> (Vec<Bucket<T>>, Vec<Vec<Click>>) {
+        let buckets = (0..self.buckets)
+            .map(|_| Bucket { rows: Vec::with_capacity(self.rows), extra: Vec::new(), ids: Vec::new(), wide: Vec::new() })
+            .collect();
+        (buckets, reserved::<Click>(self.shards, self.clicks))
+    }
+}
+
+type Reservation = Box<dyn std::any::Any + Send>;
+
+/// Parse reservations built on helper threads while the main thread reads
+/// the catalog and maps the inputs, so their first-touch page zeroing is
+/// off the serial startup path.
+struct Prepared {
+    layout: Layout,
+    ready: std::sync::Mutex<Vec<std::thread::JoinHandle<Reservation>>>,
+}
+
+impl Prepared {
+    fn spawn<T: Send + 'static>(event_bytes: usize, click_bytes: usize, threads: usize) -> Self {
+        let layout = Layout::new(event_bytes, click_bytes, threads);
+        // One lane reserves its own memory, which leaves a CPU for the
+        // serial startup.
+        let ready = (0..threads - 1)
+            .map(|_| std::thread::spawn(move || Box::new(layout.reserve::<T>()) as Reservation))
+            .collect();
+        Self { layout, ready: std::sync::Mutex::new(ready) }
+    }
+
+    fn take<T: 'static>(&self, layout: Layout) -> Option<(Vec<Bucket<T>>, Vec<Vec<Click>>)> {
+        if layout != self.layout {
+            return None;
+        }
+        let handle = self.ready.lock().unwrap().pop()?;
+        handle.join().ok()?.downcast().ok().map(|reserved| *reserved)
+    }
+}
+
+fn pipeline<T: EventTime + 'static, E: Stored + 'static>(
     data: &Path,
     out: &Path,
     threads: usize,
@@ -974,17 +1052,14 @@ fn pipeline<T: EventTime, E: Stored + 'static>(
     end: i64,
     keys: Keys,
     catalog: Catalog,
+    prepared: Option<Prepared>,
     mut stage: impl FnMut(&str),
 ) {
     let raw = Input::open_for_scan(&data.join("events"));
     let borrow_events = env::var_os("SHOPPING_BORROW_EVENT_IDS").is_some() && raw.prepare_revisit();
     // Each valid event consumes at least six bytes for separators.
     let narrow = raw.bytes() / 6 <= i32::MAX as usize;
-    let bucket_bytes = env::var("SHOPPING_BUCKET_KB").ok()
-        .and_then(|value| value.parse::<usize>().ok()).unwrap_or(6 << 10) << 10;
-    let n = ((raw.bytes() / bucket_bytes).max(1))
-        .next_power_of_two()
-        .min(4096);
+    let n = bucket_count(raw.bytes());
     let people = std::sync::Mutex::new(None);
     let clock = raw::Calendar::new(start, end);
     let fast = raw::available() && env::var_os("SHOPPING_RAW_EVENTS").is_some();
@@ -1012,8 +1087,7 @@ fn pipeline<T: EventTime, E: Stored + 'static>(
     }
     let early_clicks = env::var_os("SHOPPING_EARLY_CLICKS").is_some();
     let interleave = env::var_os("SHOPPING_INTERLEAVE_CLICKS").is_some();
-    let person_shards = n.min(env::var("SHOPPING_PERSON_SHARDS").ok()
-        .and_then(|value| value.parse::<usize>().ok()).unwrap_or(512).next_power_of_two());
+    let person_shards = person_shard_count(n);
     let group = env::var("SHOPPING_PREFETCH_GROUP").ok()
         .and_then(|value| value.parse::<usize>().ok()).unwrap_or(32).clamp(1, 128);
     let mut click_chunks = click_input.chunks().into_iter();
@@ -1033,9 +1107,8 @@ fn pipeline<T: EventTime, E: Stored + 'static>(
         let pool = pool::Pool::new(pool_scope, threads, use_pool);
         let (raw, click_input, keys, catalog, clock, people) =
             (&raw, click_input, &keys, &catalog, &clock, &people);
-        let expected = raw.bytes() / 64 / threads / n;
-        // Generated click rows average more than 50 bytes.
-        let click_rows = click_input.bytes() / 50;
+        let layout = Layout::new(raw.bytes(), click_input.bytes(), threads);
+        let prepared = &prepared;
     let lanes = std::thread::scope(|scope| {
         let readers = threads.min(4);
         for lane in 0..readers {
@@ -1049,20 +1122,15 @@ fn pipeline<T: EventTime, E: Stored + 'static>(
         pool.jobs(
             tasks,
             move |_| {
+                let (buckets, shards) = prepared.as_ref().and_then(|p| p.take::<T>(layout))
+                    .unwrap_or_else(|| layout.reserve());
                 (
                     Dates::new(),
-                    (0..n)
-                        .map(|_| Bucket {
-                            rows: Vec::with_capacity(expected),
-                            extra: Vec::new(),
-                            ids: Vec::new(),
-                            wide: Vec::new(),
-                        })
-                        .collect::<Vec<_>>(),
+                    buckets,
                     input::ReadBuffer::new(),
                     Vec::<Vec<Click>>::new(),
                     [0usize; 2],
-                    reserved::<Click>(person_shards, click_rows / threads),
+                    shards,
                     None::<std::sync::Arc<Aliases>>,
                     0usize,
                 )

@@ -32,6 +32,108 @@ fn reserved<T>(n: usize, rows: usize) -> Vec<Vec<T>> {
     (0..n).map(|_| Vec::with_capacity(each)).collect()
 }
 
+/// One dedup worker's events for every person shard, in fixed segments.
+/// Segments are carved from parse buffers the worker has already reduced,
+/// so most output lands in faulted-in memory instead of fresh pages the
+/// kernel must zero. Segments are never freed: the process ends in `_exit`.
+struct Shards<E> {
+    segments: Vec<Vec<*mut E>>,
+    lens: Vec<usize>,
+    spare: Vec<*mut E>,
+}
+
+// The raw segments are owned by exactly one worker until `into_parts`.
+unsafe impl<E: Send> Send for Shards<E> {}
+
+const SEGMENT_SHIFT: u32 = 10;
+const SEGMENT: usize = 1 << SEGMENT_SHIFT;
+
+impl<E: Copy> Shards<E> {
+    fn new(n: usize) -> Self {
+        Self { segments: (0..n).map(|_| Vec::new()).collect(), lens: vec![0; n], spare: Vec::new() }
+    }
+
+    fn count(&self) -> usize {
+        self.lens.len()
+    }
+
+    #[inline(always)]
+    fn len(&self, shard: usize) -> usize {
+        self.lens[shard]
+    }
+
+    #[inline(always)]
+    fn push(&mut self, shard: usize, value: E) {
+        let len = self.lens[shard];
+        if len >> SEGMENT_SHIFT == self.segments[shard].len() {
+            let piece = self.piece();
+            self.segments[shard].push(piece);
+        }
+        // The segment for this row exists and holds SEGMENT values.
+        unsafe { self.segments[shard].get_unchecked(len >> SEGMENT_SHIFT).add(len & (SEGMENT - 1)).write(value) };
+        self.lens[shard] = len + 1;
+    }
+
+    #[inline(always)]
+    fn at(&mut self, shard: usize, row: usize) -> &mut E {
+        assert!(row < self.lens[shard]);
+        unsafe { &mut *self.segments[shard][row >> SEGMENT_SHIFT].add(row & (SEGMENT - 1)) }
+    }
+
+    fn swap_remove(&mut self, shard: usize, row: usize) {
+        let last = self.lens[shard] - 1;
+        let value = *self.at(shard, last);
+        *self.at(shard, row) = value;
+        self.lens[shard] = last;
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn piece(&mut self) -> *mut E {
+        if let Some(piece) = self.spare.pop() {
+            return piece;
+        }
+        const SLAB: usize = 64;
+        let mut slab = std::mem::ManuallyDrop::new(Vec::<E>::with_capacity(SEGMENT * SLAB));
+        let base = slab.as_mut_ptr();
+        self.spare.extend((1..SLAB).map(|i| unsafe { base.add(i * SEGMENT) }));
+        base
+    }
+
+    /// Keep a reduced buffer's memory for later segments. Beyond a few
+    /// tasks' worth of spare segments, buffers go back to the allocator for
+    /// the person stage.
+    fn recycle<T>(&mut self, buffer: Vec<T>) {
+        const SPARE: usize = 256;
+        let step = SEGMENT * size_of::<E>();
+        let bytes = buffer.capacity() * size_of::<T>();
+        if align_of::<T>() < align_of::<E>() || bytes < step || self.spare.len() >= SPARE {
+            return;
+        }
+        let mut buffer = std::mem::ManuallyDrop::new(buffer);
+        let base = buffer.as_mut_ptr().cast::<u8>();
+        self.spare.extend((0..bytes / step).map(|i| unsafe { base.add(i * step).cast::<E>() }));
+    }
+
+    fn into_parts(self) -> Vec<Vec<&'static mut [E]>> {
+        self.segments
+            .into_iter()
+            .zip(self.lens)
+            .map(|(segments, len)| {
+                segments
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, piece)| {
+                        let n = len.saturating_sub(i * SEGMENT).min(SEGMENT);
+                        // Rows below `len` were written; segments are leaked.
+                        (n > 0).then(|| unsafe { std::slice::from_raw_parts_mut(piece, n) })
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+}
+
 fn transpose<T>(lanes: Vec<Vec<T>>, n: usize) -> Vec<Vec<T>> {
     let mut partitions = columns(n);
     for lane in lanes {
@@ -460,14 +562,14 @@ impl Routes {
         (i as usize & 511, (i >> 9) as usize)
     }
 
-    fn remove_retired<E>(&mut self, out: &mut [Vec<E>]) {
+    fn remove_retired<E: Copy>(&mut self, out: &mut Shards<E>) {
         if self.retired.is_empty() {
             return;
         }
         self.retired.sort_unstable();
         for handle in self.retired.drain(..).rev() {
             let (shard, row) = Self::index(handle);
-            out[shard].swap_remove(row);
+            out.swap_remove(shard, row);
         }
     }
 }
@@ -497,7 +599,7 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
     parts: Vec<Bucket<T>>,
     source: &Input,
     people: &Aliases,
-    out: &mut [Vec<E>],
+    out: &mut Shards<E>,
     start: i64,
     group: usize,
     routes: &mut Routes,
@@ -531,7 +633,7 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
     routes.overflow.clear();
     routes.opaque.clear();
     routes.repeats.reserve(count / 8);
-    let shard_mask = out.len() - 1;
+    let shard_mask = out.count() - 1;
     let bias = start / 1000 - ARRIVAL_BIAS;
     for (part, bin) in parts.iter().enumerate() {
         for (block_number, block) in bin.rows.chunks(group).enumerate() {
@@ -556,7 +658,7 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
                 if !repeat {
                     if let Some(t) = row.t.unpack(start) {
                         let u = name();
-                        out[u as usize & shard_mask].push(route(u, t));
+                        out.push(u as usize & shard_mask, route(u, t));
                     }
                     continue;
                 }
@@ -596,7 +698,7 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
                 let new = if let Some(t) = row.t.unpack(start) {
                     let u = if old != 0 {
                         let (shard, at) = Routes::index(old);
-                        let previous = *out[shard][at].user();
+                        let previous = *out.at(shard, at).user();
                         if previous == row.user { previous } else { name() }
                     } else {
                         name()
@@ -604,15 +706,14 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
                     let shard = u as usize & shard_mask;
                     let (previous, at) = if old == 0 { (usize::MAX, 0) } else { Routes::index(old) };
                     if previous == shard {
-                        out[shard][at] = route(u, t);
+                        *out.at(shard, at) = route(u, t);
                         old
                     } else {
                         if old != 0 {
                             routes.retired.push(old);
                         }
-                        let dest = &mut out[shard];
-                        let handle = Routes::handle(shard, dest.len());
-                        dest.push(route(u, t));
+                        let handle = Routes::handle(shard, out.len(shard));
+                        out.push(shard, route(u, t));
                         handle
                     }
                 } else {
@@ -636,10 +737,14 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
         if let Some(t) = row.t.unpack(start) {
             let detail = winner.detail(&parts);
             let u = people.canonical(row.user);
-            out[u as usize & shard_mask].push(E::encode(
+            out.push(u as usize & shard_mask, E::encode(
                 Event { u, t, cents: detail.cents, cat: detail.category }, start,
             ));
         }
+    }
+    for bin in parts {
+        out.recycle(bin.rows);
+        out.recycle(bin.extra);
     }
 }
 
@@ -843,7 +948,7 @@ fn route_clicks(people: &Aliases, clicks: &[Click], shards: &mut [Vec<Click>], g
     }
 }
 
-fn pipeline<T: EventTime, E: Stored>(
+fn pipeline<T: EventTime, E: Stored + 'static>(
     data: &Path,
     out: &Path,
     threads: usize,
@@ -1055,7 +1160,6 @@ fn pipeline<T: EventTime, E: Stored>(
         Copies(Vec<Bucket<T>>),
         Clicks(Vec<Click>),
     }
-    let event_rows = parts.iter().flatten().map(|bin| bin.rows.len()).sum::<usize>();
     let pending_clicks = pending.iter().map(Vec::len).sum::<usize>();
     let mut copies = parts.into_iter();
     let mut chunks = pending.into_iter();
@@ -1072,7 +1176,7 @@ fn pipeline<T: EventTime, E: Stored>(
     let lanes = pool.jobs(
         tasks,
         move |_| (
-            reserved(person_shards, event_rows / threads),
+            Shards::<E>::new(person_shards),
             reserved(person_shards, pending_clicks / threads),
             Routes::default(),
         ),
@@ -1088,23 +1192,26 @@ fn pipeline<T: EventTime, E: Stored>(
         },
         |_, (mut events, clicks, mut routes)| {
             routes.remove_retired(&mut events);
-            (events, clicks)
+            (events.into_parts(), clicks)
         },
     );
     let (events, mut clicks): (Vec<_>, Vec<_>) = lanes.into_iter().unzip();
     clicks.extend(pre_routed);
-    let event_parts = transpose(events, person_shards);
+    let event_parts: Vec<Vec<&mut [E]>> = transpose(events, person_shards)
+        .into_iter()
+        .map(|lanes| lanes.into_iter().flatten().collect())
+        .collect();
     let click_parts = transpose(clicks, person_shards);
     release_inputs.join().unwrap();
     stage("event dedup and click routing");
     let mut work: Vec<_> = event_parts.into_iter().zip(click_parts).collect();
     if env::var_os("SHOPPING_HEAVIEST_FIRST").is_some() {
         work.sort_unstable_by_key(|(events, clicks)| std::cmp::Reverse(
-            events.iter().map(Vec::len).sum::<usize>() + clicks.iter().map(Vec::len).sum::<usize>(),
+            events.iter().map(|s| s.len()).sum::<usize>() + clicks.iter().map(Vec::len).sum::<usize>(),
         ));
     }
-    enum Person<E> {
-        Rows(Vec<Vec<E>>, Vec<Vec<Click>>),
+    enum Person<E: 'static> {
+        Rows(Vec<&'static mut [E]>, Vec<Vec<Click>>),
         Release(usize),
     }
     // Workers that finish their people early unmap the event input in

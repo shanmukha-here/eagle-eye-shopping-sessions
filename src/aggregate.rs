@@ -751,7 +751,7 @@ impl Totals {
     pub fn partition<E: Stored>(
         &mut self,
         keys: &Keys,
-        events: Vec<Vec<E>>,
+        events: Vec<&mut [E]>,
         clicks: Vec<Vec<Click>>,
     ) {
         if self.packed {
@@ -763,16 +763,16 @@ impl Totals {
     fn partition_inner<M: Observation, E: Stored>(
         &mut self,
         keys: &Keys,
-        mut events: Vec<Vec<E>>,
+        mut events: Vec<&mut [E]>,
         mut clicks: Vec<Vec<Click>>,
     ) {
-        let ne = events.iter().map(Vec::len).sum::<usize>();
+        let ne = events.iter().map(|s| s.len()).sum::<usize>();
         if ne == 0 {
             return;
         }
         let mut table = vec![IndexSlot::default(); (ne / 12 + 8).next_power_of_two()];
         let mut groups: Vec<(Key, usize, usize)> = Vec::new();
-        for e in events.iter_mut().flatten() {
+        for e in events.iter_mut().flat_map(|s| s.iter_mut()) {
             let u = e.user();
             let i = position(&table, *u);
             if table[i].key == 0 {
@@ -815,7 +815,7 @@ impl Totals {
         let mut cs = Vec::<Touch>::with_capacity(coff);
         let event_slots = es.spare_capacity_mut();
         let click_slots = cs.spare_capacity_mut();
-        for e in events.into_iter().flatten() {
+        for &e in events.iter().flat_map(|s| s.iter()) {
             let e = e.expand(self.origin);
             let i = &mut groups[e.u as usize].1;
             event_slots[*i].write(M::new(e, self.origin));

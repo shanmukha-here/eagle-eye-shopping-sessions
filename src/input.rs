@@ -89,24 +89,33 @@ fn mib(name: &str, default: usize) -> usize {
         .min(64) << 20
 }
 
-fn is_cold(mapping: &Mmap) -> bool {
+fn missing_cache_samples(mapping: &Mmap) -> Option<usize> {
     if mapping.len() < STEP {
-        return false;
+        return Some(0);
     }
-    // Sample distinct cache pages without faulting them in. A failed probe
-    // leaves the scan on the ordinary mapped reader.
+    // Probe distinct pages without faulting them in. An unavailable probe
+    // can never establish that the source can be reread from cache.
     let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if page <= 0 {
-        return false;
+        return None;
     }
     let page = page as usize;
-    [1, 2, 3].into_iter().filter(|&quarter| {
+    let mut missing = 0;
+    for quarter in 1..=3 {
         let offset = (mapping.len() / 4 * quarter) / page * page;
         let mut resident = 0;
         let ptr = unsafe { mapping.as_ptr().add(offset) };
         let status = unsafe { libc::mincore(ptr.cast_mut().cast(), page, &mut resident) };
-        status == 0 && resident & 1 == 0
-    }).count() >= 2
+        if status != 0 {
+            return None;
+        }
+        missing += usize::from(resident & 1 == 0);
+    }
+    Some(missing)
+}
+
+fn is_cold(mapping: &Mmap) -> bool {
+    missing_cache_samples(mapping).is_some_and(|missing| missing >= 2)
 }
 
 impl Input {
@@ -190,6 +199,15 @@ impl Input {
             large_first,
             stripe,
         }
+    }
+
+    pub(crate) fn prepare_revisit(&self) -> bool {
+        if self.files.iter().any(|source| missing_cache_samples(&source.mapping) != Some(0)) {
+            return false;
+        }
+        // Sequential advice lets Linux release pages behind the scan.
+        // Mapped IDs can be consulted by later, out-of-order reduction.
+        self.files.iter().all(|source| source.mapping.advise(memmap2::Advice::Normal).is_ok())
     }
 
     pub fn bytes(&self) -> usize {

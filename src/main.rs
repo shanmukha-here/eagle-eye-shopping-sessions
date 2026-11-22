@@ -741,7 +741,7 @@ fn pipeline<T: EventTime, E: Stored>(
     mut stage: impl FnMut(&str),
 ) {
     let raw = Input::open_for_scan(&data.join("events"));
-    let borrow_events = env::var_os("SHOPPING_BORROW_EVENT_IDS").is_some();
+    let borrow_events = env::var_os("SHOPPING_BORROW_EVENT_IDS").is_some() && raw.prepare_revisit();
     // Each valid event consumes at least six bytes for separators.
     let narrow = raw.bytes() / 6 <= i32::MAX as usize;
     let n = ((raw.bytes() / (6 << 20)).max(1))
@@ -766,9 +766,12 @@ fn pipeline<T: EventTime, E: Stored>(
     if !probe {
         tasks.push(Scan::Links);
     }
-    let borrowed_click_ids = keys.click_input.is_some();
-    let local_click_input = (!borrowed_click_ids).then(|| Input::open_for_scan(&data.join("clicks")));
+    let borrowed_click_ids = keys.click_input.as_ref().is_some_and(Input::prepare_revisit);
+    let local_click_input = keys.click_input.is_none().then(|| Input::open_for_scan(&data.join("clicks")));
     let click_input = keys.click_input.as_ref().or(local_click_input.as_ref()).unwrap();
+    if env::var_os("SHOPPING_PHASE_USAGE").is_some() {
+        eprintln!("mapped opaque IDs events={borrow_events} clicks={borrowed_click_ids}");
+    }
     let early_clicks = env::var_os("SHOPPING_EARLY_CLICKS").is_some();
     let interleave = env::var_os("SHOPPING_INTERLEAVE_CLICKS").is_some();
     let person_shards = n.min(512);

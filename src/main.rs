@@ -242,19 +242,73 @@ trait EventSink<T: EventTime> {
         row.id = mix(keys.key(id));
         self.push(row, Some(detail));
     }
+
+    /// Whether `defer_user` may be used instead of keying a long user ID.
+    #[inline(always)]
+    fn defers_users(&self) -> bool {
+        false
+    }
+
+    /// Set the user of the row pushed last to `mix(keys.key(user))` for a
+    /// name longer than nine bytes. `hash` is its `opaque_names::hash`.
+    /// The bytes must stay readable until the sink is dropped.
+    fn defer_user(&mut self, _hash: u64, _user: &[u8], _keys: &Keys) {
+        unreachable!("this sink keys users immediately")
+    }
 }
+
+// A long user ID waiting for its batched name-table lookup.
+struct PendingUser {
+    bin: u32,
+    row: u32,
+    hash: u64,
+    name: *const u8,
+    len: usize,
+}
+
+const USER_BATCH: usize = 32;
 
 struct EventStore<'a, T> {
     bins: &'a mut [Bucket<T>],
     mask: usize,
     source: Option<input::FieldSource<'a>>,
+    keys: &'a Keys,
+    last_bin: usize,
+    pending: Vec<PendingUser>,
 }
 
 impl<'a, T> EventStore<'a, T> {
-    fn new(bins: &'a mut [Bucket<T>], source: Option<input::FieldSource<'a>>) -> Self {
+    fn new(bins: &'a mut [Bucket<T>], source: Option<input::FieldSource<'a>>, keys: &'a Keys) -> Self {
         assert!(bins.len().is_power_of_two());
-        Self { mask: bins.len() - 1, bins, source }
+        Self { mask: bins.len() - 1, bins, source, keys, last_bin: 0, pending: Vec::with_capacity(USER_BATCH) }
     }
+
+    // Slots were prefetched when each name was deferred. Fetch the published
+    // names together, then intern and patch the rows.
+    #[inline(never)]
+    fn resolve_users(&mut self) {
+        for user in &self.pending {
+            self.keys.prefetch_name(user.hash);
+        }
+        for user in &self.pending {
+            // Each span is a field of the chunk this sink is parsing.
+            let name = unsafe { std::slice::from_raw_parts(user.name, user.len) };
+            let key = mix(self.keys.intern_hashed(name, user.hash));
+            self.bins[user.bin as usize].rows[user.row as usize].user = key;
+        }
+        self.pending.clear();
+    }
+}
+
+impl<T> Drop for EventStore<'_, T> {
+    fn drop(&mut self) {
+        if !self.pending.is_empty() {
+            self.resolve_users();
+        }
+    }
+}
+
+impl<T> EventStore<'_, T> {
 
     #[inline(always)]
     fn bucket(&mut self, id: Key) -> &mut Bucket<T> {
@@ -266,12 +320,35 @@ impl<'a, T> EventStore<'a, T> {
 impl<T: EventTime> EventSink<T> for EventStore<'_, T> {
     #[inline(always)]
     fn push(&mut self, mut row: Candidate<T>, detail: Option<Detail>) {
+        self.last_bin = row.id as usize & self.mask;
         let bin = self.bucket(row.id);
         if let Some(detail) = detail {
             row.arrival = SIDE | bin.extra.len() as u32;
             bin.extra.push(detail);
         }
         bin.rows.push(row);
+    }
+
+    #[inline(always)]
+    fn defers_users(&self) -> bool {
+        true
+    }
+
+    #[inline(always)]
+    fn defer_user(&mut self, hash: u64, user: &[u8], keys: &Keys) {
+        debug_assert!(std::ptr::eq(keys, self.keys));
+        self.keys.prefetch_slot(hash);
+        let bin = self.last_bin;
+        self.pending.push(PendingUser {
+            bin: bin as u32,
+            row: (self.bins[bin].rows.len() - 1) as u32,
+            hash,
+            name: user.as_ptr(),
+            len: user.len(),
+        });
+        if self.pending.len() == USER_BATCH {
+            self.resolve_users();
+        }
     }
 
     fn push_opaque(&mut self, mut row: Candidate<T>, mut detail: Detail, id: &[u8], _: &Keys) {
@@ -854,7 +931,7 @@ fn pipeline<T: EventTime, E: Stored>(
                     } else {
                         (chunk.read(&mut s.2), None)
                     };
-                    let mut sink = EventStore::new(&mut s.1, source);
+                    let mut sink = EventStore::new(&mut s.1, source, keys);
                     if fast {
                         let seen = raw::events(
                             data,

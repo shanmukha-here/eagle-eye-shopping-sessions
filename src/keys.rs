@@ -138,6 +138,27 @@ impl Keys {
         self.key(id)
     }
 
+    #[inline(always)]
+    pub(crate) fn prefetch_slot(&self, hash: u64) {
+        self.table.prefetch_slot(hash);
+    }
+
+    #[inline(always)]
+    pub(crate) fn prefetch_name(&self, hash: u64) {
+        self.table.prefetch_name(hash);
+    }
+
+    /// The key `key` returns for a name longer than nine bytes, given
+    /// `opaque_names::hash` of it.
+    #[inline]
+    pub(crate) fn intern_hashed(&self, s: &[u8], hash: u64) -> Key {
+        debug_assert!(s.len() > 9);
+        if let Some(at) = self.table.intern(s, hash) {
+            return EXTERNAL | at as u64;
+        }
+        self.intern_overflow(s, hash)
+    }
+
     #[cold]
     #[inline(never)]
     fn intern(&self, s: &[u8]) -> Key {

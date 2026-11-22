@@ -858,9 +858,12 @@ unsafe fn event_opaque_tail<T: EventTime>(
         let Some((user, clock)) = read_opaque_id(next, limit) else { return std::ptr::null(); };
         let Some(tail) = checked_event_tail(clock, limit, state) else { return std::ptr::null(); };
         let valid = tail.in_window(state);
+        // Long user names would miss in the shared name table. The sink
+        // prefetches and resolves them in batches instead.
+        let defer = valid && user.len() > 9 && emit.defers_users();
         let mut row = Candidate {
             id: 0,
-            user: if valid { mix(keys.key(user)) } else { 0 },
+            user: if valid && !defer { mix(keys.key(user)) } else { 0 },
             arrival: tail.offset,
             t: T::pack(if valid { tail.time } else { INVALID }, state.start),
         };
@@ -875,6 +878,9 @@ unsafe fn event_opaque_tail<T: EventTime>(
         } else {
             row.id = mix(keys.key(id));
             emit.push(row, sale);
+        }
+        if defer {
+            emit.defer_user(crate::opaque_names::hash(user), user, keys);
         }
         tail.next
     }

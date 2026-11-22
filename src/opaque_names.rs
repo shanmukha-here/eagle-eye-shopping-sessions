@@ -165,6 +165,28 @@ impl Table {
         None
     }
 
+    /// Start loading the first slot `intern` probes for this fingerprint.
+    #[inline(always)]
+    pub(super) fn prefetch_slot(&self, hash: u64) {
+        let at = hash as usize & (self.slots - 1);
+        unsafe {
+            std::arch::x86_64::_mm_prefetch(self.start.as_ptr().add(at).cast(), std::arch::x86_64::_MM_HINT_T0);
+        }
+    }
+
+    /// Start loading the name already published in that slot, if any.
+    #[inline(always)]
+    pub(super) fn prefetch_name(&self, hash: u64) {
+        let name = self.cells()[hash as usize & (self.slots - 1)].load(Relaxed);
+        if !name.is_null() {
+            let p = name.cast::<i8>().cast_const();
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(p, std::arch::x86_64::_MM_HINT_T0);
+                std::arch::x86_64::_mm_prefetch(p.wrapping_add(63), std::arch::x86_64::_MM_HINT_T0);
+            }
+        }
+    }
+
     pub(super) fn get(&self, at: usize) -> &[u8] {
         let name = self.cells()[at].load(Acquire);
         assert!(!name.is_null(), "unknown opaque ID");

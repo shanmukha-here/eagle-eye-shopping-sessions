@@ -90,6 +90,10 @@ pub struct Totals {
     packed: bool,
     base_day: i32,
     dense_days: Vec<Vec<Stats>>,
+    // Assists of the dense days, apart from the other counters: every
+    // session adds one per active campaign, and 4-byte counts keep those
+    // scattered increments in cache. A thread never counts 2^32 sessions.
+    dense_assists: Vec<Vec<u32>>,
     campaigns: BTreeMap<i32, Vec<Stats>>,
     category_cents: Vec<i64>,
     touched: Vec<u32>,
@@ -264,6 +268,7 @@ impl Totals {
             origin: start,
             packed: end.saturating_sub(start) <= u32::MAX as i64 && cats <= 256,
             base_day,
+            dense_assists: vec![Vec::new(); dense_days.len()],
             dense_days,
             campaigns: BTreeMap::new(),
             category_cents: vec![0; cats],
@@ -283,8 +288,11 @@ impl Totals {
     }
     pub fn days(self) -> BTreeMap<i32, Vec<Stats>> {
         let mut days = self.campaigns;
-        for (i, stats) in self.dense_days.into_iter().enumerate() {
+        for (i, (mut stats, assists)) in self.dense_days.into_iter().zip(self.dense_assists).enumerate() {
             if !stats.is_empty() {
+                for (stat, count) in stats.iter_mut().zip(assists) {
+                    stat.assists += i64::from(count);
+                }
                 days.insert(self.base_day + i as i32, stats);
             }
         }
@@ -303,6 +311,35 @@ impl Totals {
             writer.row(row, keys);
         } else {
             self.users.push(row);
+        }
+    }
+    /// Credit one session on `day` to campaign `credit`, and an assist to
+    /// every active campaign.
+    #[inline(always)]
+    fn count_session(&mut self, day: i32, credit: usize, revenue: i64) {
+        let camps = self.counts.len();
+        if !self.dense_days.is_empty() {
+            let at = (day - self.base_day) as usize;
+            let stats = &mut self.dense_days[at];
+            if stats.is_empty() {
+                stats.resize(camps, Stats::default());
+                self.dense_assists[at].resize(camps, 0);
+            }
+            stats[credit].sessions += 1;
+            stats[credit].buying += i64::from(revenue > 0);
+            stats[credit].revenue += revenue;
+            let assists = &mut self.dense_assists[at];
+            for &c in &self.active {
+                assists[c as usize] += 1;
+            }
+        } else {
+            let stats = self.campaigns.entry(day).or_insert_with(|| vec![Stats::default(); camps]);
+            stats[credit].sessions += 1;
+            stats[credit].buying += i64::from(revenue > 0);
+            stats[credit].revenue += revenue;
+            for &c in &self.active {
+                stats[c as usize].assists += 1;
+            }
         }
     }
     fn add_click(&mut self, c: u32) {
@@ -399,28 +436,12 @@ impl Totals {
             self.expire(clicks[window.left].campaign);
             window.left += 1;
         }
-        let stats = if !self.dense_days.is_empty() {
-            let stats = &mut self.dense_days[(day - self.base_day) as usize];
-            if stats.is_empty() {
-                stats.resize(self.counts.len(), Stats::default());
-            }
-            stats
-        } else {
-            self.campaigns
-                .entry(day)
-                .or_insert_with(|| vec![Stats::default(); self.counts.len()])
-        };
         let credit = if self.active.is_empty() {
             0
         } else {
             window.winner as usize
         };
-        stats[credit].sessions += 1;
-        stats[credit].buying += i64::from(revenue > 0);
-        stats[credit].revenue += revenue;
-        for &c in &self.active {
-            stats[c as usize].assists += 1;
-        }
+        self.count_session(day, credit, revenue);
     }
     fn single_session<M: Observation>(&mut self, keys: &Keys, user: Key, events: &[M], clicks: &[Touch]) -> bool {
         let mut first = events[0].time(self.origin);
@@ -465,22 +486,8 @@ impl Totals {
                 best = Some(click);
             }
         }
-        let stats = if !self.dense_days.is_empty() {
-            let stats = &mut self.dense_days[(day - self.base_day) as usize];
-            if stats.is_empty() {
-                stats.resize(self.counts.len(), Stats::default());
-            }
-            stats
-        } else {
-            self.campaigns.entry(day).or_insert_with(|| vec![Stats::default(); self.counts.len()])
-        };
         let credit = best.map_or(0, |click| click.campaign as usize);
-        stats[credit].sessions += 1;
-        stats[credit].buying += i64::from(revenue > 0);
-        stats[credit].revenue += revenue;
-        for &c in &self.active {
-            stats[c as usize].assists += 1;
-        }
+        self.count_session(day, credit, revenue);
         self.finish_day(UserRow {
             u: user, day, sessions: 1, events: events.len() as i64, revenue, top: None,
         }, keys);

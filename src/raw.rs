@@ -174,6 +174,45 @@ unsafe fn hms<const CHECK: bool>(p: Ptr) -> i64 {
     }
 }
 
+/// Decode two already framed HH:MM:SS fields. The two 64-bit lanes use
+/// the same digit, separator, and range proof as the scalar decoder.
+#[inline(always)]
+unsafe fn paired_hms(a: Ptr, b: Ptr) -> Option<(i64, i64)> {
+    unsafe {
+        let raw = _mm_set_epi64x(word(b.add(11)) as i64, word(a.add(11)) as i64);
+        let x = _mm_xor_si128(raw, _mm_set1_epi64x(i64::from_le_bytes(*b"00:00:00")));
+        let digit_bits = _mm_set1_epi64x(0x0f0f000f0f000f0f);
+        let bad_letters = _mm_andnot_si128(digit_bits, x);
+        let bad_digits = _mm_and_si128(
+            _mm_add_epi64(x, _mm_set1_epi64x(0x0606000606000606)),
+            _mm_set1_epi64x(0x1010001010001010),
+        );
+        let ten = _mm_add_epi64(_mm_slli_epi64::<3>(x), _mm_slli_epi64::<1>(x));
+        let pairs = _mm_and_si128(
+            _mm_add_epi64(ten, _mm_srli_epi64::<8>(x)),
+            _mm_set1_epi64x(0xff0000ff0000ff),
+        );
+        let invalid_range = _mm_and_si128(
+            _mm_add_epi64(pairs, _mm_set1_epi64x((68 << 48) | (68 << 24) | 104)),
+            _mm_set1_epi64x(0x80000080000080),
+        );
+        let bad = _mm_or_si128(_mm_or_si128(bad_letters, bad_digits), invalid_range);
+        if _mm_testz_si128(bad, bad) == 0 {
+            return None;
+        }
+        let words = _mm_shuffle_epi8(
+            pairs,
+            _mm_setr_epi8(0, -1, 3, -1, 6, -1, -1, -1, 8, -1, 11, -1, 14, -1, -1, -1),
+        );
+        let partial = _mm_madd_epi16(words, _mm_setr_epi16(3600, 60, 1, 0, 3600, 60, 1, 0));
+        let totals = _mm_hadd_epi32(partial, partial);
+        Some((
+            i64::from(_mm_cvtsi128_si32(totals)) * 1000,
+            i64::from(_mm_extract_epi32::<1>(totals)) * 1000,
+        ))
+    }
+}
+
 /// A 16-byte readable span is guaranteed by the row decoder. Only the
 /// first thirteen lanes are part of the timestamp.
 #[inline(always)]
@@ -216,6 +255,13 @@ unsafe fn stamp<const WIDTH: usize>(p: Ptr, calendar: &Calendar) -> i64 {
                 INVALID
             };
         }
+        offset_millis(p).map_or(INVALID, |offset| day + time + offset)
+    }
+}
+
+#[inline(always)]
+unsafe fn offset_millis(p: Ptr) -> Option<i64> {
+    unsafe {
         let op = p.add(19).read();
         let z0 = p.add(20).read().wrapping_sub(b'0');
         let z1 = p.add(21).read().wrapping_sub(b'0');
@@ -228,15 +274,15 @@ unsafe fn stamp<const WIDTH: usize>(p: Ptr, calendar: &Calendar) -> i64 {
             || z2 > 9
             || z3 > 9
         {
-            return INVALID;
+            return None;
         }
         let hours = z0 * 10 + z1;
         let minutes = z2 * 10 + z3;
         if hours > 23 || minutes > 59 {
-            return INVALID;
+            return None;
         }
         let offset = (i64::from(hours) * 60 + i64::from(minutes)) * 60_000;
-        day + time + if op == b'+' { -offset } else { offset }
+        Some(if op == b'+' { -offset } else { offset })
     }
 }
 
@@ -646,19 +692,32 @@ unsafe fn checked_event_tail(clock: Ptr, limit: Ptr, state: State<'_>) -> Option
         {
             return None;
         }
-        let time = match width {
-            13 => stamp::<13>(ts, state.clock),
-            20 => stamp::<20>(ts, state.clock),
-            _ => stamp::<25>(ts, state.clock),
-        };
         let day = state.clock.day(received);
-        let millis = hms::<true>(received);
-        if time == INVALID || day == INVALID || millis == INVALID
-            || received.add(10).read() != b'T' || received.add(19).read() != b'Z'
-        {
+        if day == INVALID || received.add(10).read() != b'T' || received.add(19).read() != b'Z' {
             return None;
         }
-        let arrived = day + millis;
+        let (time, arrived) = if width == 13 {
+            let time = epoch_millis(ts);
+            let arrival_clock = hms::<true>(received);
+            if time == INVALID || arrival_clock == INVALID {
+                return None;
+            }
+            (time, day + arrival_clock)
+        } else {
+            let (event_clock, arrival_clock) = paired_hms(ts, received)?;
+            if ts.add(10).read() != b'T' {
+                return None;
+            }
+            let same_day = word(ts) == word(received)
+                && ts.add(8).cast::<u16>().read_unaligned()
+                    == received.add(8).cast::<u16>().read_unaligned();
+            let event_day = if same_day { day } else { state.clock.day(ts) };
+            if event_day == INVALID {
+                return None;
+            }
+            let zone = if width == 25 { offset_millis(ts)? } else { 0 };
+            (event_day + event_clock + zone, day + arrival_clock)
+        };
         let offset = arrived / 1000 - state.start / 1000 + ARRIVAL_BIAS;
         if offset as u64 >= u64::from(SIDE) {
             return None;
@@ -751,7 +810,7 @@ unsafe fn event_opaque_tail<T: EventTime>(
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn event_cursors<const N: usize, const PREFIX: bool, const TAIL_SCAN: bool, T: EventTime>(
+unsafe fn event_cursors<const N: usize, const PREFIX: bool, const TAIL_SCAN: bool, const COUNT: bool, T: EventTime>(
     data: &[u8],
     date: &mut Dates,
     keys: &Keys,
@@ -782,7 +841,7 @@ unsafe fn event_cursors<const N: usize, const PREFIX: bool, const TAIL_SCAN: boo
                 if TAIL_SCAN {
                     let following = event_tail_scan::<T>(p, ends[i], state, keys, emit);
                     if !following.is_null() {
-                        count[0] += 1;
+                        if COUNT { count[0] += 1; }
                         cursor[i] = following;
                         continue;
                     }
@@ -797,9 +856,9 @@ unsafe fn event_cursors<const N: usize, const PREFIX: bool, const TAIL_SCAN: boo
                         event::<7, T>(p, end, state, emit)
                     }
                 {
-                    count[0] += 1;
+                    if COUNT { count[0] += 1; }
                 } else {
-                    count[1] += 1;
+                    if COUNT { count[1] += 1; }
                     let row = std::slice::from_raw_parts(p, following.offset_from(p) as usize);
                     crate::events(row, date, keys, catalog, state.start, state.end, emit);
                 }
@@ -822,26 +881,31 @@ pub(super) fn events<T: EventTime>(
     end: i64,
     emit: &mut (impl EventSink<T> + ?Sized),
     level: usize,
+    count_rows: bool,
 ) -> [usize; 2] {
     let state = State { clock, start, end };
     // The caller has checked AVX2. Keep the probe checkpoints consistent.
     unsafe {
         if level == 7 {
             if std::env::var_os("SHOPPING_LF_IN_TAIL").is_some() {
-                return event_cursors::<1, true, true, T>(data, date, keys, catalog, state, emit);
+                return if count_rows {
+                    event_cursors::<1, true, true, true, T>(data, date, keys, catalog, state, emit)
+                } else {
+                    event_cursors::<1, true, true, false, T>(data, date, keys, catalog, state, emit)
+                };
             }
             if std::env::var_os("SHOPPING_MASKED_PREFIX").is_some() {
-                return event_cursors::<1, true, false, T>(data, date, keys, catalog, state, emit);
+                return event_cursors::<1, true, false, true, T>(data, date, keys, catalog, state, emit);
             }
             match std::env::var("SHOPPING_ROW_CURSORS").as_deref() {
                 Ok("1") => {
-                    return event_cursors::<1, false, false, T>(data, date, keys, catalog, state, emit);
+                    return event_cursors::<1, false, false, true, T>(data, date, keys, catalog, state, emit);
                 }
                 Ok("2") => {
-                    return event_cursors::<2, false, false, T>(data, date, keys, catalog, state, emit);
+                    return event_cursors::<2, false, false, true, T>(data, date, keys, catalog, state, emit);
                 }
                 Ok("3") => {
-                    return event_cursors::<3, false, false, T>(data, date, keys, catalog, state, emit);
+                    return event_cursors::<3, false, false, true, T>(data, date, keys, catalog, state, emit);
                 }
                 _ => {}
             }

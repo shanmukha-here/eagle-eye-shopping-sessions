@@ -826,7 +826,7 @@ pub(crate) fn pipeline(
                 Scan::Events(chunk) => {
                     let bytes = chunk.read(buffer);
                     if fast {
-                        raw::events(bytes, dates, &keys, &catalog, &clock, start, end, emit, 7);
+                        raw::events(bytes, dates, &keys, &catalog, &clock, start, end, emit, 7, false);
                     } else {
                         events(bytes, dates, &keys, &catalog, start, end, emit);
                     }

@@ -65,7 +65,30 @@ impl Drop for Unpublished {
     }
 }
 
+#[inline]
 pub(super) fn hash(bytes: &[u8]) -> u64 {
+    #[cfg(target_feature = "sse4.2")]
+    if bytes.len() == 33 {
+        use std::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
+        // Two independent halves cover every byte. These are only table
+        // fingerprints; both callers compare the original bytes on a tie.
+        let ptr = bytes.as_ptr().cast::<u64>();
+        let (head, tail) = unsafe {
+            let a = _mm_crc32_u64(0xc2b2ae35, ptr.read_unaligned());
+            let a = _mm_crc32_u64(a, ptr.add(1).read_unaligned());
+            let b = _mm_crc32_u64(0x9e3779b9, ptr.add(2).read_unaligned());
+            let b = _mm_crc32_u64(b, ptr.add(3).read_unaligned());
+            let b = _mm_crc32_u8(b as u32, *bytes.get_unchecked(32));
+            (a, u64::from(b))
+        };
+        return crate::keys::mix(head << 32 | tail);
+    }
+    portable_hash(bytes)
+}
+
+#[cold]
+#[inline(never)]
+fn portable_hash(bytes: &[u8]) -> u64 {
     const HASH: ahash::RandomState = ahash::RandomState::with_seeds(
         0x243f6a8885a308d3,
         0x13198a2e03707344,

@@ -239,14 +239,27 @@ trait EventSink<T: EventTime> {
 
 struct EventStore<'a, T> {
     bins: &'a mut [Bucket<T>],
+    mask: usize,
     source: Option<input::FieldSource<'a>>,
+}
+
+impl<'a, T> EventStore<'a, T> {
+    fn new(bins: &'a mut [Bucket<T>], source: Option<input::FieldSource<'a>>) -> Self {
+        assert!(bins.len().is_power_of_two());
+        Self { mask: bins.len() - 1, bins, source }
+    }
+
+    #[inline(always)]
+    fn bucket(&mut self, id: Key) -> &mut Bucket<T> {
+        // new() establishes the power-of-two length, which cannot change.
+        unsafe { self.bins.get_unchecked_mut(id as usize & self.mask) }
+    }
 }
 
 impl<T: EventTime> EventSink<T> for EventStore<'_, T> {
     #[inline(always)]
     fn push(&mut self, mut row: Candidate<T>, detail: Option<Detail>) {
-        let bucket = row.id as usize & (self.bins.len() - 1);
-        let bin = &mut self.bins[bucket];
+        let bin = self.bucket(row.id);
         if let Some(detail) = detail {
             row.arrival = SIDE | bin.extra.len() as u32;
             bin.extra.push(detail);
@@ -259,8 +272,7 @@ impl<T: EventTime> EventSink<T> for EventStore<'_, T> {
         detail.opaque = Some(if let Some(handle) = self.source.and_then(|source| source.field_handle(id)) {
             IdSpan::file(handle)
         } else {
-            let bucket = row.id as usize & (self.bins.len() - 1);
-            let bin = &mut self.bins[bucket];
+            let bin = self.bucket(row.id);
             let start = bin.ids.len();
             bin.ids.extend_from_slice(id);
             IdSpan::arena(start, id.len(), &mut bin.wide)
@@ -833,7 +845,7 @@ fn pipeline<T: EventTime, E: Stored>(
                     } else {
                         (chunk.read(&mut s.2), None)
                     };
-                    let mut sink = EventStore { bins: &mut s.1, source };
+                    let mut sink = EventStore::new(&mut s.1, source);
                     if fast {
                         let seen = raw::events(
                             data,
@@ -845,6 +857,7 @@ fn pipeline<T: EventTime, E: Stored>(
                             end,
                             &mut sink,
                             level,
+                            probe,
                         );
                         s.4[0] += seen[0];
                         s.4[1] += seen[1];

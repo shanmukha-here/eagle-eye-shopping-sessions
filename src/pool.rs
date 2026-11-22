@@ -32,6 +32,18 @@ impl<'scope> Pool<'scope> {
         Self { channels, threads }
     }
 
+    pub(super) fn lanes(&self) -> usize {
+        self.channels.len()
+    }
+
+    /// Hands `job(lane)` to every idle worker without waiting for it.
+    /// Returns how many workers accepted it.
+    pub(super) fn detach(&self, job: fn(usize)) -> usize {
+        self.channels.iter().enumerate()
+            .filter(|(lane, queue)| { let lane = *lane; queue.send(Box::new(move || job(lane))).is_ok() })
+            .count()
+    }
+
     pub(super) fn jobs<T, R, S>(
         &self,
         tasks: Vec<T>,

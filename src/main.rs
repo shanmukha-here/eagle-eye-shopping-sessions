@@ -38,8 +38,15 @@ fn reserved<T>(n: usize, rows: usize) -> Vec<Vec<T>> {
 /// kernel must zero. Segments are never freed: the process ends in `_exit`.
 struct Shards<E> {
     segments: Vec<Vec<*mut E>>,
-    lens: Vec<usize>,
+    lanes: Vec<Lane<E>>,
     spare: Vec<*mut E>,
+}
+
+/// A shard's length and, inside a segment, its next free slot, kept
+/// together so the common push reads one entry.
+struct Lane<E> {
+    head: *mut E,
+    len: usize,
 }
 
 // The raw segments are owned by exactly one worker until `into_parts`.
@@ -50,41 +57,62 @@ const SEGMENT: usize = 1 << SEGMENT_SHIFT;
 
 impl<E: Copy> Shards<E> {
     fn new(n: usize) -> Self {
-        Self { segments: (0..n).map(|_| Vec::new()).collect(), lens: vec![0; n], spare: Vec::new() }
+        Self {
+            segments: (0..n).map(|_| Vec::new()).collect(),
+            lanes: (0..n).map(|_| Lane { head: std::ptr::null_mut(), len: 0 }).collect(),
+            spare: Vec::new(),
+        }
     }
 
     fn count(&self) -> usize {
-        self.lens.len()
+        self.lanes.len()
     }
 
     #[inline(always)]
     fn len(&self, shard: usize) -> usize {
-        self.lens[shard]
+        self.lanes[shard].len
     }
 
     #[inline(always)]
     fn push(&mut self, shard: usize, value: E) {
-        let len = self.lens[shard];
+        let lane = &mut self.lanes[shard];
+        if lane.len & (SEGMENT - 1) == 0 {
+            return self.push_first(shard, value);
+        }
+        // Inside a segment the head is the slot for row `len`.
+        unsafe {
+            lane.head.write(value);
+            lane.head = lane.head.add(1);
+        }
+        lane.len += 1;
+    }
+
+    #[inline(never)]
+    fn push_first(&mut self, shard: usize, value: E) {
+        let len = self.lanes[shard].len;
         if len >> SEGMENT_SHIFT == self.segments[shard].len() {
             let piece = self.piece();
             self.segments[shard].push(piece);
         }
         // The segment for this row exists and holds SEGMENT values.
-        unsafe { self.segments[shard].get_unchecked(len >> SEGMENT_SHIFT).add(len & (SEGMENT - 1)).write(value) };
-        self.lens[shard] = len + 1;
+        let slot = self.segments[shard][len >> SEGMENT_SHIFT];
+        unsafe { slot.write(value) };
+        self.lanes[shard] = Lane { head: unsafe { slot.add(1) }, len: len + 1 };
     }
 
     #[inline(always)]
     fn at(&mut self, shard: usize, row: usize) -> &mut E {
-        assert!(row < self.lens[shard]);
+        assert!(row < self.lanes[shard].len);
         unsafe { &mut *self.segments[shard][row >> SEGMENT_SHIFT].add(row & (SEGMENT - 1)) }
     }
 
     fn swap_remove(&mut self, shard: usize, row: usize) {
-        let last = self.lens[shard] - 1;
+        let last = self.lanes[shard].len - 1;
         let value = *self.at(shard, last);
         *self.at(shard, row) = value;
-        self.lens[shard] = last;
+        let slot = self.segments[shard][last >> SEGMENT_SHIFT];
+        // `head` is read only when `last` is inside a segment.
+        self.lanes[shard] = Lane { head: slot.wrapping_add(last & (SEGMENT - 1)), len: last };
     }
 
     #[cold]
@@ -118,7 +146,7 @@ impl<E: Copy> Shards<E> {
     fn into_parts(self) -> Vec<Vec<&'static mut [E]>> {
         self.segments
             .into_iter()
-            .zip(self.lens)
+            .zip(self.lanes.into_iter().map(|lane| lane.len))
             .map(|(segments, len)| {
                 segments
                     .into_iter()
@@ -931,6 +959,9 @@ fn main() {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(8)
         .clamp(1, 64);
+    if env::var_os("SHOPPING_PHASE_USAGE").is_some() {
+        eprintln!("start_unix_ns={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    }
     let mut mark = Instant::now();
     let mut last = env::var_os("SHOPPING_PHASE_USAGE").map(|_| usage());
     let stage = |name: &str| {
@@ -1025,6 +1056,99 @@ fn csv_bytes(folder: &Path) -> usize {
 /// huge-page faults compact memory and evicted input is read again (lab,
 /// 60M: 2.3-3.3 s with huge pages, 2.0-2.1 s without). Turn them off for
 /// the process when reclaimable memory is under three times the input.
+const ZAP_RANGES: usize = 1024;
+// Range count, bytes per part, parts, ready, done, abandoned, then the ranges.
+static ZAP: [std::sync::atomic::AtomicUsize; 2 * ZAP_RANGES + 6] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 2 * ZAP_RANGES + 6];
+
+/// Exit frees every page of the process on one thread, which takes 0.1-0.3 s
+/// at 60M with small pages. Before exiting, release the large private
+/// anonymous regions (allocator arenas and reservations) on this thread and
+/// every idle pool worker. Once all of them have reached the barrier, none
+/// reads the heap again: each uses only its stack and `ZAP`, and the workers
+/// sleep until the caller ends the process.
+fn release_before_exit(pool: &pool::Pool) {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    let lanes = pool.lanes();
+    let threads = fs::read_dir("/proc/self/task").map(|tasks| tasks.count()).ok();
+    if lanes == 0 || threads != Some(lanes + 1) || env::var_os("SHOPPING_KEEP_AT_EXIT").is_some() {
+        return;
+    }
+    let Ok(maps) = fs::read_to_string("/proc/self/maps") else { return };
+    let (mut count, mut total) = (0, 0);
+    for line in maps.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // Private writable mappings without a file. Allocators name theirs
+        // [anon:...]; [stack] and [heap] are excluded.
+        let range = match fields[..] {
+            [range, "rw-p", _, _, "0"] => range,
+            [range, "rw-p", _, _, "0", name] if name.starts_with("[anon:") => range,
+            _ => continue,
+        };
+        let Some((start, end)) = range.split_once('-') else { continue };
+        let (Ok(start), Ok(end)) = (usize::from_str_radix(start, 16), usize::from_str_radix(end, 16)) else { continue };
+        if end - start >= 32 << 20 && count < ZAP_RANGES {
+            ZAP[6 + 2 * count].store(start, Relaxed);
+            ZAP[7 + 2 * count].store(end - start, Relaxed);
+            count += 1;
+            total += end - start;
+        }
+    }
+    drop(maps);
+    if env::var_os("SHOPPING_PHASE_USAGE").is_some() {
+        eprintln!("exit release: {count} regions, {total} bytes, {} parts", lanes + 1);
+    }
+    ZAP[0].store(count, Relaxed);
+    ZAP[1].store(total.div_ceil(lanes + 1).next_multiple_of(2 << 20), Relaxed);
+    ZAP[2].store(lanes + 1, Release);
+    fn zap(part: usize) {
+        let (count, share) = (ZAP[0].load(Relaxed), ZAP[1].load(Relaxed));
+        let (begin, end) = (part * share, (part + 1) * share);
+        let mut offset = 0;
+        for i in 0..count {
+            let (start, len) = (ZAP[6 + 2 * i].load(Relaxed), ZAP[7 + 2 * i].load(Relaxed));
+            let (lo, hi) = (begin.max(offset), end.min(offset + len));
+            if lo < hi {
+                unsafe { libc::madvise((start + lo - offset) as *mut libc::c_void, hi - lo, libc::MADV_DONTNEED) };
+            }
+            offset += len;
+        }
+    }
+    // Returns whether every part arrived, and so may release its share.
+    fn barrier(deadline: Option<Instant>) -> bool {
+        let parts = ZAP[2].load(Acquire);
+        ZAP[3].fetch_add(1, Release);
+        while ZAP[3].load(Acquire) < parts {
+            if ZAP[5].load(Acquire) != 0 {
+                return false;
+            }
+            if deadline.is_some_and(|deadline| Instant::now() > deadline) {
+                ZAP[5].store(1, Release);
+                return ZAP[3].load(Acquire) >= parts;
+            }
+            std::hint::spin_loop();
+        }
+        true
+    }
+    fn worker(part: usize) -> ! {
+        if barrier(None) {
+            zap(part);
+        }
+        ZAP[4].fetch_add(1, Release);
+        loop {
+            unsafe { libc::pause() };
+        }
+    }
+    let sent = pool.detach(|lane| worker(lane + 1));
+    // A missing worker abandons the release instead of delaying the exit.
+    if sent == lanes && barrier(Some(Instant::now() + std::time::Duration::from_millis(100))) {
+        zap(0);
+        while ZAP[4].load(Acquire) < lanes {
+            std::hint::spin_loop();
+        }
+    }
+}
+
 fn huge_page_policy(input_bytes: usize) {
     let available = || -> Option<usize> {
         let info = fs::read_to_string("/proc/meminfo").ok()?;
@@ -1088,11 +1212,15 @@ impl Layout {
 
     fn reserve<T>(self) -> (Vec<Bucket<T>>, Vec<Vec<Click>>) {
         let buckets = (0..self.buckets)
-            .map(|_| Bucket { rows: Vec::with_capacity(self.rows), extra: Vec::new(), ids: Vec::new(), wide: Vec::new() })
+            .map(|_| Bucket { rows: Vec::with_capacity(self.rows), extra: Vec::with_capacity(self.rows / EXTRA_SHARE), ids: Vec::new(), wide: Vec::new() })
             .collect();
         (buckets, reserved::<Click>(self.shards, self.clicks))
     }
 }
+
+// Purchases and long event IDs carry a detail row; reserving for an eighth
+// of the rows avoids most regrowth copies across the buckets.
+const EXTRA_SHARE: usize = 8;
 
 type Reservation = Box<dyn std::any::Any + Send>;
 
@@ -1411,7 +1539,7 @@ fn pipeline<T: EventTime + 'static, E: Stored + 'static>(
         // every worker instead of on one thread during process exit.
         pool.jobs((0..threads).collect(), |_| (), move |_, part| click_input.release_part(part, threads), |_, _| ());
     }
-    finish(out, catalog, partial, stage)
+    finish(out, catalog, partial, || release_before_exit(&pool), stage)
     })
 }
 
@@ -1419,6 +1547,7 @@ fn finish(
     out: &Path,
     catalog: &Catalog,
     partial: Vec<BTreeMap<i32, Vec<Stats>>>,
+    release: impl FnOnce(),
     mut stage: impl FnMut(&str),
 ) -> ! {
     let mut all = BTreeMap::new();
@@ -1458,7 +1587,23 @@ fn finish(
             for (kb, head) in big.iter().take(20) { eprintln!("{kb:>9} kB {head}"); }
         }
     }
+    if env::var_os("SHOPPING_PHASE_USAGE").is_some() {
+        eprintln!("exit_unix_ns={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    }
     // Both Parquet footers have been closed and all output workers joined.
+    let report = env::var_os("SHOPPING_PHASE_USAGE").is_some();
+    release();
+    if report {
+        // The heap may be released: format on the stack and write directly.
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let mut line = *b"released_unix_ns=00000000000000000000\n";
+        let mut value = now;
+        for digit in line[17..37].iter_mut().rev() {
+            *digit = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+        unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+    }
     unsafe extern "C" {
         fn _exit(status: std::ffi::c_int) -> !;
     }

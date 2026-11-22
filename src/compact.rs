@@ -963,5 +963,5 @@ pub(crate) fn pipeline(
         },
     );
     stage("dense_person_user_parquet");
-    finish(out, &catalog, partial, stage)
+    finish(out, &catalog, partial, || (), stage)
 }

@@ -107,6 +107,17 @@ pub(super) fn hash(bytes: &[u8]) -> u64 {
 /// A second 64-bit fingerprint, independent of `hash` (which is CRC-based,
 /// so a second CRC would collide together with it).
 pub(super) fn check_hash(bytes: &[u8]) -> u64 {
+    if bytes.len() == 33 {
+        // Folded 128-bit products of the words, unrelated to the CRC.
+        let word = |i: usize| u64::from_le_bytes(bytes[8 * i..8 * i + 8].try_into().unwrap());
+        let fold = |a: u64, b: u64| {
+            let p = u128::from(a) * u128::from(b);
+            p as u64 ^ (p >> 64) as u64
+        };
+        let x = fold(word(0) ^ 0x452821e638d01377, word(1) ^ 0xbe5466cf34e90c6c);
+        let y = fold(word(2) ^ 0xc0ac29b7c97c50dd, word(3) ^ 0x3f84d5b5b5470917);
+        return fold(x ^ 0x9216d5d98979fb1b, y ^ u64::from(bytes[32]) ^ 0xd1310ba698dfb5ac);
+    }
     const HASH: ahash::RandomState = ahash::RandomState::with_seeds(
         0x452821e638d01377,
         0xbe5466cf34e90c6c,

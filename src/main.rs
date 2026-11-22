@@ -343,21 +343,32 @@ struct Bucket<T> {
     extra: Vec<Detail>,
     ids: Vec<u8>,
     wide: Vec<(usize, usize)>,
-    // Hashed long event IDs: (row, check hash) in row order, and one bit
-    // per row marking them, so dedup tests one bit per repeated position.
-    long: Vec<(u32, u64)>,
+    // Check hashes of hashed long event IDs in row order, and one bit per
+    // row marking those rows. A row's entry is its rank among marked rows.
+    long: Vec<u64>,
     long_rows: Vec<u64>,
 }
 
 impl<T> Bucket<T> {
+    /// `ranks[w]` counts the marked rows before word `w` of `long_rows`.
     #[inline(always)]
-    fn long_check(&self, row: usize) -> Option<u64> {
-        let marked = self.long_rows.get(row / 64).is_some_and(|w| w >> (row % 64) & 1 != 0);
-        if !marked {
+    fn long_check(&self, ranks: &[u32], row: usize) -> Option<u64> {
+        let word = *self.long_rows.get(row / 64)?;
+        let below = word & ((1u64 << (row % 64)) - 1);
+        if word >> (row % 64) & 1 == 0 {
             return None;
         }
-        let at = self.long.binary_search_by_key(&(row as u32), |&(r, _)| r).unwrap();
-        Some(self.long[at].1)
+        Some(self.long[(ranks[row / 64] + below.count_ones()) as usize])
+    }
+
+    fn long_ranks(&self, ranks: &mut Vec<u32>) {
+        ranks.clear();
+        let mut total = 0;
+        ranks.extend(self.long_rows.iter().map(|w| {
+            let before = total;
+            total += w.count_ones();
+            before
+        }));
     }
 }
 
@@ -581,7 +592,7 @@ impl<T: EventTime> EventSink<T> for EventStore<'_, T> {
             let index = row.id as usize & self.mask;
             let at = self.heads[index].len;
             let bin = self.bucket(row.id);
-            bin.long.push((at, crate::opaque_names::check_hash(id)));
+            bin.long.push(crate::opaque_names::check_hash(id));
             let word = at as usize / 64;
             if word >= bin.long_rows.len() {
                 bin.long_rows.resize((word + 1).max(bin.long_rows.len() * 2), 0);
@@ -683,6 +694,7 @@ struct Routes {
     overflow: IntMap<(i64, u64)>,
     opaque: hashbrown::HashTable<OpaqueWinner>,
     long: IntMap<u64>,
+    ranks: Vec<u32>,
     retired: Vec<u64>,
     seen: Vec<u64>,
     collisions: Vec<u64>,
@@ -773,10 +785,12 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
     routes.overflow.clear();
     routes.opaque.clear();
     routes.long.clear();
+    routes.long.reserve(count / 64);
     routes.repeats.reserve(count / 8);
     let shard_mask = out.count() - 1;
     let bias = start / 1000 - ARRIVAL_BIAS;
     for (part, bin) in parts.iter().enumerate() {
+        bin.long_ranks(&mut routes.ranks);
         for (block_number, block) in bin.rows.chunks(group).enumerate() {
             let mut need_alias = people.prefetch_mask(block, |row| row.user);
             for (within_block, &row) in block.iter().enumerate() {
@@ -821,7 +835,7 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
                     }
                     continue;
                 }
-                if let Some(check) = bin.long_check(block_number * group + within_block) {
+                if let Some(check) = bin.long_check(&routes.ranks, block_number * group + within_block) {
                     let seen = *routes.long.entry(row.id).or_insert(check);
                     if seen != check {
                         LONG_COLLISION.store(true, std::sync::atomic::Ordering::Relaxed);

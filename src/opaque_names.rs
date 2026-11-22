@@ -11,7 +11,36 @@ use std::{
 
 struct Name {
     hash: u64,
-    bytes: Box<[u8]>,
+    bytes: NameBytes,
+}
+
+enum NameBytes {
+    Inline { len: u8, bytes: [u8; 40] },
+    OutOfLine(Box<[u8]>),
+}
+
+impl Name {
+    fn new(hash: u64, raw: &[u8]) -> Self {
+        let bytes = if raw.len() <= 40 {
+            let mut content = [0; 40];
+            content[..raw.len()].copy_from_slice(raw);
+            NameBytes::Inline {
+                len: raw.len() as u8,
+                bytes: content,
+            }
+        } else {
+            NameBytes::OutOfLine(raw.into())
+        };
+        Self { hash, bytes }
+    }
+
+    #[inline]
+    fn bytes(&self) -> &[u8] {
+        match &self.bytes {
+            NameBytes::Inline { len, bytes } => &bytes[..usize::from(*len)],
+            NameBytes::OutOfLine(bytes) => bytes,
+        }
+    }
 }
 
 pub(super) struct Table {
@@ -88,10 +117,7 @@ impl Table {
             let mut current = cell.load(Acquire);
             if current.is_null() {
                 if candidate.0.is_null() {
-                    candidate.0 = Box::into_raw(Box::new(Name {
-                        hash,
-                        bytes: bytes.into(),
-                    }));
+                    candidate.0 = Box::into_raw(Box::new(Name::new(hash, bytes)));
                 }
                 match cell.compare_exchange(ptr::null_mut(), candidate.0, AcqRel, Acquire) {
                     Ok(_) => {
@@ -106,7 +132,7 @@ impl Table {
             // Acquire above pairs with publication. The table retains the
             // initialized object until its last borrower has gone away.
             let existing = unsafe { &*current };
-            if existing.hash == hash && existing.bytes.as_ref() == bytes {
+            if existing.hash == hash && existing.bytes() == bytes {
                 return Some(at);
             }
             at = (at + 1) & mask;
@@ -121,7 +147,7 @@ impl Table {
         assert!(!name.is_null(), "unknown opaque ID");
         // Only a published slot can yield a handle, and it remains owned by
         // this table for the duration of the returned borrow.
-        unsafe { (*name).bytes.as_ref() }
+        unsafe { (*name).bytes() }
     }
 }
 

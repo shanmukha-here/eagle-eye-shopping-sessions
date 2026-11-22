@@ -158,17 +158,22 @@ impl Keys {
             out.extend_from_slice(&self.overflow[shard].lock().unwrap().strings[index]);
             return;
         }
+        let (bytes, len) = Self::short_name(k);
+        out.extend_from_slice(&bytes[..len]);
+    }
+
+    #[inline]
+    fn short_name(k: Key) -> ([u8; 9], usize) {
         let packed = k & LOW;
         let len = 8 - packed.trailing_zeros() as usize / 8;
-        out.extend_from_slice(&packed.to_be_bytes()[..len]);
-        let mut last = 0;
+        let mut bytes = [0; 9];
+        bytes[..8].copy_from_slice(&packed.to_be_bytes());
         for i in 0..7 {
-            last |= (((k >> (7 + 8 * i)) & 1) as u8) << i;
+            bytes[8] |= (((k >> (7 + 8 * i)) & 1) as u8) << i;
         }
-        if last != 0 {
-            out.push(last);
-        }
+        (bytes, len + usize::from(bytes[8] != 0))
     }
+
     #[inline]
     pub fn cmp(&self, a: Key, b: Key) -> Ordering {
         if (a | b) & EXTERNAL == 0 {
@@ -181,7 +186,15 @@ impl Keys {
             }
             match (self.resident(a), self.resident(b)) {
                 (Some(a), Some(b)) => a.cmp(b),
+                (Some(name), None) if b & EXTERNAL == 0 => {
+                    let (short, len) = Self::short_name(b);
+                    name.cmp(&short[..len])
+                }
                 (Some(a), None) => a.cmp(&self.bytes(b)),
+                (None, Some(name)) if a & EXTERNAL == 0 => {
+                    let (short, len) = Self::short_name(a);
+                    short[..len].cmp(name)
+                }
                 (None, Some(b)) => self.bytes(a).as_slice().cmp(b),
                 (None, None) => self.bytes(a).cmp(&self.bytes(b)),
             }

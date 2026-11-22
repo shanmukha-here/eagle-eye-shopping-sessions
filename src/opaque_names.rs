@@ -104,6 +104,18 @@ pub(super) fn hash(bytes: &[u8]) -> u64 {
 
 #[cold]
 #[inline(never)]
+/// A second 64-bit fingerprint, independent of `hash` (which is CRC-based,
+/// so a second CRC would collide together with it).
+pub(super) fn check_hash(bytes: &[u8]) -> u64 {
+    const HASH: ahash::RandomState = ahash::RandomState::with_seeds(
+        0x452821e638d01377,
+        0xbe5466cf34e90c6c,
+        0xc0ac29b7c97c50dd,
+        0x3f84d5b5b5470917,
+    );
+    HASH.hash_one(bytes)
+}
+
 fn portable_hash(bytes: &[u8]) -> u64 {
     const HASH: ahash::RandomState = ahash::RandomState::with_seeds(
         0x243f6a8885a308d3,

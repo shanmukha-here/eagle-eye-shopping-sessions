@@ -343,6 +343,35 @@ struct Bucket<T> {
     extra: Vec<Detail>,
     ids: Vec<u8>,
     wide: Vec<(usize, usize)>,
+    // Hashed long event IDs: (row, check hash) in row order, and one bit
+    // per row marking them, so dedup tests one bit per repeated position.
+    long: Vec<(u32, u64)>,
+    long_rows: Vec<u64>,
+}
+
+impl<T> Bucket<T> {
+    #[inline(always)]
+    fn long_check(&self, row: usize) -> Option<u64> {
+        let marked = self.long_rows.get(row / 64).is_some_and(|w| w >> (row % 64) & 1 != 0);
+        if !marked {
+            return None;
+        }
+        let at = self.long.binary_search_by_key(&(row as u32), |&(r, _)| r).unwrap();
+        Some(self.long[at].1)
+    }
+}
+
+/// Long event IDs are keyed by a 55-bit hash in a key domain no short key
+/// uses: bits 63 and 61 set (interned keys have small indices below bit 62)
+/// and a zero low 7-bit lane (packed keys have none). Two different IDs on
+/// one key are found in dedup by their independent check hashes; the run
+/// then restarts with every long ID compared byte for byte.
+static EXACT_LONG_IDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LONG_COLLISION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[inline(always)]
+fn long_key(hash: u64) -> Key {
+    (hash | 1 << 63 | 1 << 61) & !0x7f
 }
 trait EventTime: Copy + Send {
     fn pack(t: i64, start: i64) -> Self;
@@ -434,13 +463,15 @@ struct EventStore<'a, T> {
     keys: &'a Keys,
     last_bin: usize,
     pending: Vec<PendingUser>,
+    exact_long: bool,
 }
 
 impl<'a, T> EventStore<'a, T> {
     fn new(bins: &'a mut [Bucket<T>], source: Option<input::FieldSource<'a>>, keys: &'a Keys) -> Self {
         assert!(bins.len().is_power_of_two());
         let heads = bins.iter_mut().map(|bin| RowHead::of(&mut bin.rows)).collect();
-        Self { mask: bins.len() - 1, bins, heads, source, keys, last_bin: 0, pending: Vec::with_capacity(USER_BATCH) }
+        let exact_long = EXACT_LONG_IDS.load(std::sync::atomic::Ordering::Relaxed);
+        Self { mask: bins.len() - 1, bins, heads, source, keys, last_bin: 0, pending: Vec::with_capacity(USER_BATCH), exact_long }
     }
 
     #[cold]
@@ -545,6 +576,22 @@ impl<T: EventTime> EventSink<T> for EventStore<'_, T> {
     }
 
     fn push_opaque(&mut self, mut row: Candidate<T>, mut detail: Detail, id: &[u8], _: &Keys) {
+        if !self.exact_long {
+            row.id = mix(long_key(crate::opaque_names::hash(id)));
+            let index = row.id as usize & self.mask;
+            let at = self.heads[index].len;
+            let bin = self.bucket(row.id);
+            bin.long.push((at, crate::opaque_names::check_hash(id)));
+            let word = at as usize / 64;
+            if word >= bin.long_rows.len() {
+                bin.long_rows.resize((word + 1).max(bin.long_rows.len() * 2), 0);
+            }
+            bin.long_rows[word] |= 1 << (at % 64);
+            // Without a sale or an outlying clock the arrival stays inline,
+            // as for short IDs.
+            let side = detail.cents != 0 || row.arrival & SIDE != 0;
+            return self.push(row, side.then_some(detail));
+        }
         row.id = crate::opaque_names::hash(id);
         detail.opaque = Some(if let Some(handle) = self.source.and_then(|source| source.field_handle(id)) {
             IdSpan::file(handle)
@@ -613,7 +660,8 @@ fn events<T: EventTime>(
             }
             let arrival = ingest / 1000;
             let offset = arrival - start / 1000 + ARRIVAL_BIAS;
-            candidate.arrival = offset as u32;
+            // An outlying clock keeps its full arrival in a detail row.
+            candidate.arrival = if (offset as u64) < u64::from(SIDE) { offset as u32 } else { SIDE };
             let detail = Detail {
                 arrival,
                 cents,
@@ -634,6 +682,7 @@ struct Routes {
     repeats: IntMap<u64>,
     overflow: IntMap<(i64, u64)>,
     opaque: hashbrown::HashTable<OpaqueWinner>,
+    long: IntMap<u64>,
     retired: Vec<u64>,
     seen: Vec<u64>,
     collisions: Vec<u64>,
@@ -723,6 +772,7 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
     routes.repeats.clear();
     routes.overflow.clear();
     routes.opaque.clear();
+    routes.long.clear();
     routes.repeats.reserve(count / 8);
     let shard_mask = out.count() - 1;
     let bias = start / 1000 - ARRIVAL_BIAS;
@@ -770,6 +820,12 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
                         }
                     }
                     continue;
+                }
+                if let Some(check) = bin.long_check(block_number * group + within_block) {
+                    let seen = *routes.long.entry(row.id).or_insert(check);
+                    if seen != check {
+                        LONG_COLLISION.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
                 }
                 // Normal ingest times fit in a 32-bit interval around
                 // the manifest. Large route vectors and outlying clocks use
@@ -959,6 +1015,7 @@ fn main() {
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(8)
         .clamp(1, 64);
+    EXACT_LONG_IDS.store(env::var_os("SHOPPING_EXACT_LONG_IDS").is_some(), std::sync::atomic::Ordering::Relaxed);
     if env::var_os("SHOPPING_PHASE_USAGE").is_some() {
         eprintln!("start_unix_ns={}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
     }
@@ -1217,9 +1274,18 @@ impl Layout {
         let share = populate_share();
         let buckets = (0..self.buckets)
             .map(|_| {
-                let bucket = Bucket { rows: Vec::with_capacity(self.rows), extra: Vec::with_capacity(self.rows / EXTRA_SHARE), ids: Vec::new(), wide: Vec::new() };
+                let long_ids = !EXACT_LONG_IDS.load(std::sync::atomic::Ordering::Relaxed);
+                let bucket = Bucket {
+                    rows: Vec::with_capacity(self.rows),
+                    extra: Vec::with_capacity(self.rows / if long_ids { EXTRA_SHARE * 3 } else { EXTRA_SHARE }),
+                    ids: Vec::new(),
+                    wide: Vec::new(),
+                    long: Vec::with_capacity(if long_ids { self.rows / LONG_SHARE } else { 0 }),
+                    long_rows: if long_ids { vec![0; self.rows / 64 + 1] } else { Vec::new() },
+                };
                 populate(&bucket.rows, share);
                 populate(&bucket.extra, share);
+                populate(&bucket.long, share);
                 bucket
             })
             .collect();
@@ -1255,6 +1321,9 @@ fn populate<T>(v: &Vec<T>, percent: usize) {
 // Purchases and long event IDs carry a detail row; reserving for an eighth
 // of the rows avoids most regrowth copies across the buckets.
 const EXTRA_SHARE: usize = 8;
+// Hashed long event IDs (about 13% of rows) carry a check hash instead, and
+// only purchases (about 3%) a detail row.
+const LONG_SHARE: usize = 6;
 
 type Reservation = Box<dyn std::any::Any + Send>;
 
@@ -1533,6 +1602,19 @@ fn pipeline<T: EventTime + 'static, E: Stored + 'static>(
         .collect();
     let click_parts = transpose(clicks, person_shards);
     release_inputs.join().unwrap();
+    let exact_long = EXACT_LONG_IDS.load(std::sync::atomic::Ordering::Relaxed);
+    if !exact_long && (LONG_COLLISION.load(std::sync::atomic::Ordering::Relaxed)
+        || env::var_os("SHOPPING_FORCE_LONG_COLLISION").is_some())
+    {
+        // Nothing is written yet. Run again with byte-exact long IDs.
+        use std::os::unix::process::CommandExt;
+        eprintln!("long event ID hash collision: restarting with exact long IDs");
+        let error = std::process::Command::new(env::current_exe().unwrap())
+            .args(env::args_os().skip(1))
+            .env("SHOPPING_EXACT_LONG_IDS", "1")
+            .exec();
+        panic!("restart failed: {error}");
+    }
     stage("event dedup and click routing");
     let mut work: Vec<_> = event_parts.into_iter().zip(click_parts).collect();
     if env::var_os("SHOPPING_HEAVIEST_FIRST").is_some() {

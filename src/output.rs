@@ -38,26 +38,45 @@ const CAMPAIGN: &str = "message campaign_daily {
     REQUIRED INT64 sessions; REQUIRED INT64 purchasing_sessions; REQUIRED INT64 revenue_cents;
     REQUIRED INT64 assisted_sessions; }";
 
-pub fn users(path: &Path, rows: &[UserRow], keys: &Keys, categories: &[ByteArray]) {
-    let mut out = crate::pages::Output::users(path);
-    let mut name = Vec::new();
-    let mut previous = None;
-    for row in rows {
-        if previous != Some(row.u) {
-            name.clear();
-            keys.append_bytes(row.u, &mut name);
-            previous = Some(row.u);
+pub(crate) struct UserWriter {
+    output: crate::pages::Output<6>,
+    name: Vec<u8>,
+    previous: Option<u64>,
+    categories: Vec<ByteArray>,
+}
+
+impl UserWriter {
+    pub(crate) fn open(path: &Path, categories: &[ByteArray], narrow: bool, dictionary: bool) -> Self {
+        Self {
+            output: crate::pages::Output::users(path, narrow, dictionary),
+            name: Vec::new(),
+            previous: None,
+            categories: categories.to_vec(),
         }
-        out.user(
-            &name,
-            row.day,
-            row.sessions,
-            row.events,
-            row.revenue,
-            row.top.map(|category| categories[category as usize].data()),
-        );
     }
-    out.close();
+
+    pub(crate) fn row(&mut self, row: UserRow, keys: &Keys) {
+        let same = self.previous == Some(row.u);
+        if !same {
+            self.name.clear();
+            keys.append_bytes(row.u, &mut self.name);
+            self.previous = Some(row.u);
+        }
+        self.output.user(&self.name, same, row.day, row.sessions, row.events, row.revenue,
+            row.top.map(|c| self.categories[c as usize].data()));
+    }
+
+    pub(crate) fn close(self) -> usize {
+        self.output.close()
+    }
+}
+
+pub fn users(path: &Path, rows: &[UserRow], keys: &Keys, categories: &[ByteArray]) {
+    let mut writer = UserWriter::open(path, categories, false, false);
+    for row in rows {
+        writer.row(*row, keys);
+    }
+    writer.close();
 }
 pub fn campaigns(path: &Path, days: BTreeMap<i32, Vec<Stats>>, catalog: &[(ByteArray, ByteArray)]) {
     let mut f = file(path, CAMPAIGN);

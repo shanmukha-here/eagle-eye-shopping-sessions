@@ -74,7 +74,7 @@ impl Stats {
         self.assists += other.assists;
     }
 }
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct UserRow {
     pub u: Key,
     pub day: i32,
@@ -85,6 +85,7 @@ pub struct UserRow {
 }
 pub struct Totals {
     pub users: Vec<UserRow>,
+    pub(crate) writer: Option<crate::output::UserWriter>,
     origin: i64,
     packed: bool,
     base_day: i32,
@@ -254,6 +255,7 @@ impl Totals {
         };
         Self {
             users: Vec::new(),
+            writer: None,
             origin: start,
             packed: end.saturating_sub(start) <= u32::MAX as i64 && cats <= 256,
             base_day,
@@ -276,7 +278,7 @@ impl Totals {
         }
         days
     }
-    fn finish_day(&mut self, mut row: UserRow) {
+    fn finish_day(&mut self, mut row: UserRow, keys: &Keys) {
         let mut best = 0;
         for cat in self.touched.drain(..) {
             let amount = std::mem::take(&mut self.category_cents[cat as usize]);
@@ -285,7 +287,11 @@ impl Totals {
                 best = amount;
             }
         }
-        self.users.push(row);
+        if let Some(writer) = &mut self.writer {
+            writer.row(row, keys);
+        } else {
+            self.users.push(row);
+        }
     }
     fn add_click(&mut self, c: u32) {
         let i = c as usize;
@@ -321,7 +327,7 @@ impl Totals {
             let start = events[at].time(self.origin);
             let day = start.div_euclid(DAY) as i32;
             if row.day != day {
-                self.finish_day(row);
+                self.finish_day(row, keys);
                 row = UserRow {
                     u,
                     day,
@@ -352,7 +358,7 @@ impl Totals {
             row.revenue += revenue;
             self.credit(keys, clicks, start, day, revenue, &mut window);
         }
-        self.finish_day(row);
+        self.finish_day(row, keys);
         for c in self.active.drain(..) {
             self.counts[c as usize] = 0;
         }
@@ -469,7 +475,7 @@ impl Totals {
                     let day = session_start.div_euclid(DAY) as i32;
                     if row.day != day {
                         if row.sessions != 0 {
-                            self.finish_day(row);
+                            self.finish_day(row, keys);
                         }
                         row = UserRow {
                             u,
@@ -504,7 +510,7 @@ impl Totals {
             session_revenue,
             &mut window,
         );
-        self.finish_day(row);
+        self.finish_day(row, keys);
         for c in self.active.drain(..) {
             self.counts[c as usize] = 0;
         }

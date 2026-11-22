@@ -264,12 +264,48 @@ fn events<T: EventTime>(
     );
 }
 
+#[derive(Default)]
+struct Routes {
+    repeats: IntMap<u64>,
+    overflow: IntMap<(i64, u64)>,
+    retired: Vec<u64>,
+    seen: Vec<u64>,
+    collisions: Vec<u64>,
+}
+
+impl Routes {
+    // Zero is a winner with no valid output. The remaining handles are
+    // stable indices into this worker's destination vectors.
+    #[inline(always)]
+    fn handle(shard: usize, row: usize) -> u64 {
+        1 + ((row as u64) << 9 | shard as u64)
+    }
+
+    #[inline(always)]
+    fn index(handle: u64) -> (usize, usize) {
+        let i = handle - 1;
+        (i as usize & 511, (i >> 9) as usize)
+    }
+
+    fn remove_retired<E>(&mut self, out: &mut [Vec<E>]) {
+        if self.retired.is_empty() {
+            return;
+        }
+        self.retired.sort_unstable();
+        for handle in self.retired.drain(..).rev() {
+            let (shard, row) = Self::index(handle);
+            out[shard].swap_remove(row);
+        }
+    }
+}
+
 fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
     parts: Vec<Bucket<T>>,
     people: &Aliases,
     out: &mut [Vec<E>],
     start: i64,
     group: usize,
+    routes: &mut Routes,
 ) {
     let count = parts.iter().map(|bin| bin.rows.len()).sum::<usize>();
     if count == 0 {
@@ -278,8 +314,11 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
     // First find unique hash positions in a cache-resident bitmap. Only IDs
     // at repeated positions require a full-key minimum-ingest reduction.
     let bits = (count * 16).max(64).next_power_of_two();
-    let mut seen = vec![0u64; if PAIRED_BITS { 0 } else { bits / 64 }];
-    let mut collisions = vec![0u64; bits / if PAIRED_BITS { 32 } else { 64 }];
+    routes.seen.clear();
+    routes.collisions.clear();
+    routes.seen.resize(if PAIRED_BITS { 0 } else { bits / 64 }, 0);
+    routes.collisions.resize(bits / if PAIRED_BITS { 32 } else { 64 }, 0);
+    let (seen, collisions) = (&mut routes.seen, &mut routes.collisions);
     let index = |key: u64| (key >> 20) as usize & (bits - 1);
     for e in parts.iter().flat_map(|bin| &bin.rows) {
         let i = index(e.id);
@@ -293,61 +332,89 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
             seen[i / 64] |= mask;
         }
     }
-    let mut emit = |e: Candidate<T>, d: Detail| {
-        if let Some(t) = e.t.unpack(start) {
-            let u = people.canonical(e.user);
-            let shard = u as usize & (out.len() - 1);
-            out[shard].push(E::encode(
-                Event {
-                    u,
-                    t,
-                    cents: d.cents,
-                    cat: d.category,
-                },
-                start,
-            ));
-        }
-    };
-    let mut repeated = IntMap::<(Candidate<T>, Detail)>::default();
-    repeated.reserve(count / 8);
+    routes.repeats.clear();
+    routes.overflow.clear();
+    routes.repeats.reserve(count / 8);
+    let shard_mask = out.len() - 1;
+    let bias = start / 1000 - ARRIVAL_BIAS;
     for bin in parts {
         for block in bin.rows.chunks(group) {
-            for e in block {
-                people.prefetch(e.user);
+            for row in block {
+                people.prefetch(row.user);
             }
-            for &e in block {
-                let d = if e.arrival & SIDE == 0 {
-                    Detail {
-                        arrival: i64::from(e.arrival) + start / 1000 - ARRIVAL_BIAS,
-                        cents: 0,
-                        category: 0,
+            for &row in block {
+                let bit = (row.id >> 20) as usize & (bits - 1);
+                let repeat = if PAIRED_BITS {
+                    collisions[bit / 32] & (2u64 << (2 * (bit % 32))) != 0
+                } else {
+                    collisions[bit / 64] & (1u64 << (bit % 64)) != 0
+                };
+                let side = row.arrival & SIDE != 0;
+                let detail = if side {
+                    bin.extra[(row.arrival ^ SIDE) as usize]
+                } else {
+                    Detail { arrival: i64::from(row.arrival) + bias, cents: 0, category: 0 }
+                };
+                let route = |u, t| E::encode(Event { u, t, cents: detail.cents, cat: detail.category }, start);
+                if !repeat {
+                    if let Some(t) = row.t.unpack(start) {
+                        let u = people.canonical(row.user);
+                        out[u as usize & shard_mask].push(route(u, t));
+                    }
+                    continue;
+                }
+                // Normal ingest times fit in a 32-bit interval around
+                // the manifest. Large route vectors and outlying clocks use
+                // full-width entries for the affected IDs.
+                const EMPTY: u64 = u64::MAX;
+                const WIDE: u64 = !(u32::MAX as u64);
+                let base = start / 1000 - (1i64 << 31);
+                let state = routes.repeats.entry(row.id).or_insert(EMPTY);
+                let (old_arrival, old) = match *state {
+                    EMPTY => (i64::MAX, 0),
+                    WIDE => routes.overflow[&row.id],
+                    compact => (base + (compact >> 32) as i64, compact & u32::MAX as u64),
+                };
+                if detail.arrival >= old_arrival {
+                    continue;
+                }
+                let new = if let Some(t) = row.t.unpack(start) {
+                    let u = if old != 0 {
+                        let (shard, at) = Routes::index(old);
+                        let previous = *out[shard][at].user();
+                        if previous == row.user { previous } else { people.canonical(row.user) }
+                    } else {
+                        people.canonical(row.user)
+                    };
+                    let shard = u as usize & shard_mask;
+                    let (previous, at) = if old == 0 { (usize::MAX, 0) } else { Routes::index(old) };
+                    if previous == shard {
+                        out[shard][at] = route(u, t);
+                        old
+                    } else {
+                        if old != 0 {
+                            routes.retired.push(old);
+                        }
+                        let dest = &mut out[shard];
+                        let handle = Routes::handle(shard, dest.len());
+                        dest.push(route(u, t));
+                        handle
                     }
                 } else {
-                    bin.extra[(e.arrival ^ SIDE) as usize]
+                    if old != 0 {
+                        routes.retired.push(old);
+                    }
+                    0
                 };
-                let i = index(e.id);
-                let duplicated = if PAIRED_BITS {
-                    collisions[i / 32] & (2u64 << (2 * (i % 32))) != 0
+                let delta = (detail.arrival - base) as u64;
+                if delta < u32::MAX as u64 && new <= u32::MAX as u64 {
+                    *state = delta << 32 | new;
                 } else {
-                    collisions[i / 64] & (1u64 << (i % 64)) != 0
-                };
-                if !duplicated {
-                    emit(e, d);
-                } else {
-                    repeated
-                        .entry(e.id)
-                        .and_modify(|old| {
-                            if d.arrival < old.1.arrival {
-                                *old = (e, d)
-                            }
-                        })
-                        .or_insert((e, d));
+                    routes.overflow.insert(row.id, (detail.arrival, new));
+                    *state = WIDE;
                 }
             }
         }
-    }
-    for (e, d) in repeated.into_values() {
-        emit(e, d);
     }
 }
 
@@ -507,6 +574,8 @@ fn pipeline<T: EventTime, E: Stored>(
     mut stage: impl FnMut(&str),
 ) {
     let raw = Input::open_for_scan(&data.join("events"));
+    // Each valid event consumes at least six bytes for separators.
+    let narrow = raw.bytes() / 6 <= i32::MAX as usize;
     let n = ((raw.bytes() / (6 << 20)).max(1))
         .next_power_of_two()
         .min(4096);
@@ -651,16 +720,16 @@ fn pipeline<T: EventTime, E: Stored>(
             tasks.push(Work::Clicks(chunk));
         }
     }
-    let lanes = jobs(
+    let lanes = input::jobs_finish(
         tasks,
         threads,
-        |_| (columns(person_shards), columns(person_shards)),
+        |_| (columns(person_shards), columns(person_shards), Routes::default()),
         |s, task| match task {
             Work::Copies(part) => {
                 if paired_bits {
-                    winners::<T, E, true>(part, &people, &mut s.0, start, group);
+                    winners::<T, E, true>(part, &people, &mut s.0, start, group, &mut s.2);
                 } else {
-                    winners::<T, E, false>(part, &people, &mut s.0, start, group);
+                    winners::<T, E, false>(part, &people, &mut s.0, start, group, &mut s.2);
                 }
             }
             Work::Clicks(chunk) => {
@@ -675,6 +744,10 @@ fn pipeline<T: EventTime, E: Stored>(
                     }
                 }
             }
+        },
+        |_, (mut events, clicks, mut routes)| {
+            routes.remove_retired(&mut events);
+            (events, clicks)
         },
     );
     let (events, clicks): (Vec<_>, Vec<_>) = lanes.into_iter().unzip();
@@ -692,17 +765,18 @@ fn pipeline<T: EventTime, E: Stored>(
     let partial = input::jobs_finish(
         work,
         threads,
-        |_| Totals::new(catalog.categories.len(), catalog.channels.len(), start, end),
+        |i| {
+            let mut totals = Totals::new(catalog.categories.len(), catalog.channels.len(), start, end);
+            totals.writer = Some(output::UserWriter::open(
+                &out.join(format!("user_daily/part-{i}.parquet")), &catalog.categories, narrow, true,
+            ));
+            totals
+        },
         |local, (es, cs)| {
             local.partition(&keys, es, cs);
         },
-        |i, totals| {
-            output::users(
-                &out.join(format!("user_daily/part-{i}.parquet")),
-                &totals.users,
-                &keys,
-                &catalog.categories,
-            );
+        |_, mut totals| {
+            totals.writer.take().unwrap().close();
             totals.days()
         },
     );

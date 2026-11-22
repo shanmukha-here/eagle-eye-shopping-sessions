@@ -237,6 +237,32 @@ impl Input {
         }
     }
 
+    /// Release every `parts`-th window of the mapped files, starting at `part`.
+    /// Callers guarantee that no reader uses the mapping any more.
+    pub fn release_part(&self, part: usize, parts: usize) {
+        let window = self.release_window;
+        if window == 0 {
+            return;
+        }
+        let mut index = 0;
+        for source in &self.files {
+            let file = &source.mapping;
+            if source.buffered.is_some() {
+                continue;
+            }
+            for off in (0..file.len()).step_by(window) {
+                if index % parts == part {
+                    unsafe {
+                        let _ = file.unchecked_advise_range(
+                            memmap2::UncheckedAdvice::DontNeed, off, (file.len() - off).min(window),
+                        );
+                    }
+                }
+                index += 1;
+            }
+        }
+    }
+
     pub fn prefetch(&self, lane: usize, lanes: usize) {
         use std::os::fd::AsRawFd;
         let window = self.read_ahead;
@@ -300,6 +326,10 @@ pub struct Chunk<'a> {
     populate: bool,
 }
 impl<'a> Chunk<'a> {
+    pub(crate) fn len(&self) -> usize {
+        self.end - self.start
+    }
+
     pub(crate) fn field_source(&self) -> FieldSource<'a> {
         FieldSource { file: self.file, index: self.file_index }
     }

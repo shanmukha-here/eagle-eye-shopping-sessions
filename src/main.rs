@@ -25,6 +25,13 @@ fn columns<T>(n: usize) -> Vec<Vec<T>> {
     (0..n).map(|_| Vec::new()).collect()
 }
 
+// Shards sized from a row estimate rarely grow, so pushes avoid copying.
+fn reserved<T>(n: usize, rows: usize) -> Vec<Vec<T>> {
+    let each = rows / n.max(1);
+    let each = if each == 0 { 0 } else { each + each / 4 + 16 };
+    (0..n).map(|_| Vec::with_capacity(each)).collect()
+}
+
 fn transpose<T>(lanes: Vec<Vec<T>>, n: usize) -> Vec<Vec<T>> {
     let mut partitions = columns(n);
     for lane in lanes {
@@ -807,6 +814,8 @@ fn pipeline<T: EventTime, E: Stored>(
         let (raw, click_input, keys, catalog, clock, people) =
             (&raw, click_input, &keys, &catalog, &clock, &people);
         let expected = raw.bytes() / 64 / threads / n;
+        // Generated click rows average more than 50 bytes.
+        let click_rows = click_input.bytes() / 50;
     let lanes = std::thread::scope(|scope| {
         let readers = threads.min(4);
         for lane in 0..readers {
@@ -833,7 +842,7 @@ fn pipeline<T: EventTime, E: Stored>(
                     input::ReadBuffer::new(),
                     Vec::<Vec<Click>>::new(),
                     [0usize; 2],
-                    columns::<Click>(person_shards),
+                    reserved::<Click>(person_shards, click_rows / threads),
                     None::<std::sync::Arc<Aliases>>,
                     0usize,
                 )
@@ -866,7 +875,7 @@ fn pipeline<T: EventTime, E: Stored>(
                     }
                 }
                 Scan::Clicks(chunk) => {
-                    let mut pending = Vec::new();
+                    let mut pending = Vec::with_capacity(chunk.len() / 48 + 16);
                     let (bytes, source) = if borrowed_click_ids {
                         (chunk.records(), Some(chunk.field_source()))
                     } else {
@@ -949,6 +958,8 @@ fn pipeline<T: EventTime, E: Stored>(
         Copies(Vec<Bucket<T>>),
         Clicks(Vec<Click>),
     }
+    let event_rows = parts.iter().flatten().map(|bin| bin.rows.len()).sum::<usize>();
+    let pending_clicks = pending.iter().map(Vec::len).sum::<usize>();
     let mut copies = parts.into_iter();
     let mut chunks = pending.into_iter();
     let paired_bits = env::var_os("SHOPPING_PAIRED_BITS").is_some();
@@ -963,7 +974,11 @@ fn pipeline<T: EventTime, E: Stored>(
     }
     let lanes = pool.jobs(
         tasks,
-        move |_| (columns(person_shards), columns(person_shards), Routes::default()),
+        move |_| (
+            reserved(person_shards, event_rows / threads),
+            reserved(person_shards, pending_clicks / threads),
+            Routes::default(),
+        ),
         move |s, task| match task {
             Work::Copies(part) => {
                 if paired_bits {
@@ -984,15 +999,23 @@ fn pipeline<T: EventTime, E: Stored>(
     let event_parts = transpose(events, person_shards);
     let click_parts = transpose(clicks, person_shards);
     release_inputs.join().unwrap();
-    if borrow_events {
-        pool_scope.spawn(move || raw.release_pages());
-    }
     stage("event dedup and click routing");
     let mut work: Vec<_> = event_parts.into_iter().zip(click_parts).collect();
     if env::var_os("SHOPPING_HEAVIEST_FIRST").is_some() {
         work.sort_unstable_by_key(|(events, clicks)| std::cmp::Reverse(
             events.iter().map(Vec::len).sum::<usize>() + clicks.iter().map(Vec::len).sum::<usize>(),
         ));
+    }
+    enum Person<E> {
+        Rows(Vec<Vec<E>>, Vec<Vec<Click>>),
+        Release(usize),
+    }
+    // Workers that finish their people early unmap the event input in
+    // parallel, so process exit does not tear it down on one thread.
+    const RELEASE_PARTS: usize = 16;
+    let mut work: Vec<_> = work.into_iter().map(|(es, cs)| Person::Rows(es, cs)).collect();
+    if borrow_events {
+        work.extend((0..RELEASE_PARTS).map(Person::Release));
     }
     let partial = pool.jobs(
         work,
@@ -1003,8 +1026,9 @@ fn pipeline<T: EventTime, E: Stored>(
             ));
             totals
         },
-        move |local, (es, cs)| {
-            local.partition(keys, es, cs);
+        move |local, task| match task {
+            Person::Rows(es, cs) => local.partition(keys, es, cs),
+            Person::Release(part) => raw.release_part(part, RELEASE_PARTS),
         },
         |_, mut totals| {
             totals.writer.take().unwrap().close();
@@ -1012,6 +1036,11 @@ fn pipeline<T: EventTime, E: Stored>(
         },
     );
     stage("person sorts, aggregation and user parquet");
+    if borrowed_click_ids {
+        // Attribution has finished with the mapped click IDs. Unmap them on
+        // every worker instead of on one thread during process exit.
+        pool.jobs((0..threads).collect(), |_| (), move |_, part| click_input.release_part(part, threads), |_, _| ());
+    }
     finish(out, catalog, partial, stage)
     })
 }
@@ -1042,6 +1071,23 @@ fn finish(
         io_mark("last_parquet_write_returned", after);
     }
     stage("parquet");
+    if env::var_os("SHOPPING_DUMP_MAPS").is_some() {
+        eprintln!("{}", fs::read_to_string("/proc/self/smaps_rollup").unwrap_or_default());
+        if let Ok(maps) = fs::read_to_string("/proc/self/smaps") {
+            let mut big = Vec::new();
+            let mut head = String::new();
+            for line in maps.lines() {
+                if line.contains('-') && !line.starts_with(|c: char| c.is_ascii_uppercase()) {
+                    head = line.to_string();
+                } else if let Some(rss) = line.strip_prefix("Rss:") {
+                    let kb: u64 = rss.trim().trim_end_matches(" kB").trim().parse().unwrap_or(0);
+                    if kb >= 16384 { big.push((kb, head.clone())); }
+                }
+            }
+            big.sort_unstable_by(|a, b| b.cmp(a));
+            for (kb, head) in big.iter().take(20) { eprintln!("{kb:>9} kB {head}"); }
+        }
+    }
     // Both Parquet footers have been closed and all output workers joined.
     unsafe extern "C" {
         fn _exit(status: std::ffi::c_int) -> !;

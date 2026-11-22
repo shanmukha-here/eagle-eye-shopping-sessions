@@ -388,8 +388,19 @@ struct PendingUser {
 
 const USER_BATCH: usize = 32;
 
+/// Where a bucket's next row goes. The heads of all buckets are dense, so
+/// the scatter's bookkeeping stays in L1 beside the rows being written.
+struct RowHead<T> {
+    rows: *mut Candidate<T>,
+    len: u32,
+    cap: u32,
+}
+
 struct EventStore<'a, T> {
     bins: &'a mut [Bucket<T>],
+    // Rows below each head's length are written; the bucket vectors take
+    // those lengths back when the store drops.
+    heads: Vec<RowHead<T>>,
     mask: usize,
     source: Option<input::FieldSource<'a>>,
     keys: &'a Keys,
@@ -400,7 +411,18 @@ struct EventStore<'a, T> {
 impl<'a, T> EventStore<'a, T> {
     fn new(bins: &'a mut [Bucket<T>], source: Option<input::FieldSource<'a>>, keys: &'a Keys) -> Self {
         assert!(bins.len().is_power_of_two());
-        Self { mask: bins.len() - 1, bins, source, keys, last_bin: 0, pending: Vec::with_capacity(USER_BATCH) }
+        let heads = bins.iter_mut().map(|bin| RowHead::of(&mut bin.rows)).collect();
+        Self { mask: bins.len() - 1, bins, heads, source, keys, last_bin: 0, pending: Vec::with_capacity(USER_BATCH) }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, bin: usize, row: Candidate<T>) {
+        let rows = &mut self.bins[bin].rows;
+        // The head's rows are initialized, and its length never exceeds the capacity.
+        unsafe { rows.set_len(self.heads[bin].len as usize) };
+        rows.push(row);
+        self.heads[bin] = RowHead::of(rows);
     }
 
     // Slots were prefetched when each name was deferred. Fetch the published
@@ -414,7 +436,9 @@ impl<'a, T> EventStore<'a, T> {
             // Each span is a field of the chunk this sink is parsing.
             let name = unsafe { std::slice::from_raw_parts(user.name, user.len) };
             let key = mix(self.keys.intern_hashed(name, user.hash));
-            self.bins[user.bin as usize].rows[user.row as usize].user = key;
+            let head = &self.heads[user.bin as usize];
+            assert!(user.row < head.len);
+            unsafe { (*head.rows.add(user.row as usize)).user = key };
         }
         self.pending.clear();
     }
@@ -424,6 +448,20 @@ impl<T> Drop for EventStore<'_, T> {
     fn drop(&mut self) {
         if !self.pending.is_empty() {
             self.resolve_users();
+        }
+        for (bin, head) in self.bins.iter_mut().zip(&self.heads) {
+            // The store wrote every row below the head's length in place.
+            unsafe { bin.rows.set_len(head.len as usize) };
+        }
+    }
+}
+
+impl<T> RowHead<T> {
+    fn of(rows: &mut Vec<Candidate<T>>) -> Self {
+        Self {
+            rows: rows.as_mut_ptr(),
+            len: u32::try_from(rows.len()).unwrap(),
+            cap: u32::try_from(rows.capacity()).unwrap_or(u32::MAX),
         }
     }
 }
@@ -440,13 +478,20 @@ impl<T> EventStore<'_, T> {
 impl<T: EventTime> EventSink<T> for EventStore<'_, T> {
     #[inline(always)]
     fn push(&mut self, mut row: Candidate<T>, detail: Option<Detail>) {
-        self.last_bin = row.id as usize & self.mask;
-        let bin = self.bucket(row.id);
+        let index = row.id as usize & self.mask;
+        self.last_bin = index;
         if let Some(detail) = detail {
+            let bin = self.bucket(row.id);
             row.arrival = SIDE | bin.extra.len() as u32;
             bin.extra.push(detail);
         }
-        bin.rows.push(row);
+        // new() made one head per bucket, and the mask is below their count.
+        let head = unsafe { self.heads.get_unchecked_mut(index) };
+        if head.len == head.cap {
+            return self.grow(index, row);
+        }
+        unsafe { head.rows.add(head.len as usize).write(row) };
+        head.len += 1;
     }
 
     #[inline(always)]
@@ -461,7 +506,7 @@ impl<T: EventTime> EventSink<T> for EventStore<'_, T> {
         let bin = self.last_bin;
         self.pending.push(PendingUser {
             bin: bin as u32,
-            row: (self.bins[bin].rows.len() - 1) as u32,
+            row: self.heads[bin].len - 1,
             hash,
             name: user.as_ptr(),
             len: user.len(),

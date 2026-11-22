@@ -756,17 +756,18 @@ unsafe fn event_tail_body<const PURCHASE: bool>(clock: Ptr, limit: Ptr, state: S
         let separators = mask(b',' as i8) & live;
         let quote_bits = mask(b'"' as i8) & live;
         let cut = separators.trailing_zeros();
-        let before = separators.wrapping_sub(1);
-        let product_quote = quote_bits & before;
-        let price_quote = quote_bits & !before & !separators;
-        // Field quoting varies row by row, so the framing proofs combine
-        // without branches.
+        // A quoted field has quotes on both of its ends and none inside, so
+        // the opening quotes fix the only valid quote mask. Field quoting
+        // varies row by row, so the proof uses no branches.
+        let product_quoted = quote_bits & 1;
+        let price_quoted = (separators << 1) & quote_bits;
+        let expected = (product_quoted.wrapping_neg() & (1 | 1u32.wrapping_shl(cut.wrapping_sub(1))))
+            | price_quoted
+            | (u32::from(price_quoted != 0) << (width_tail.wrapping_sub(1) & 31));
         let framing_bad = (separators.count_ones() != 1) | (cut == 0)
-            | ((product_quote != 0)
-                & ((cut < 3) | (product_quote != (1 | 1u32.wrapping_shl(cut.wrapping_sub(1))))))
-            | ((price_quote != 0)
-                & ((width_tail <= cut + 2)
-                    | (price_quote != ((separators << 1) | 1u32.wrapping_shl(width_tail.wrapping_sub(1))))));
+            | (quote_bits != expected)
+            | ((product_quoted != 0) & (cut < 3))
+            | ((price_quoted != 0) & (width_tail <= cut + 2));
         if framing_bad {
             return None;
         }
@@ -804,10 +805,10 @@ unsafe fn event_tail_body<const PURCHASE: bool>(clock: Ptr, limit: Ptr, state: S
         if PURCHASE {
             // The masks above proved both field spans and their quotes.
             let (cut, width_tail) = (cut as usize, width_tail as usize);
-            let quoted = usize::from(price_quote != 0);
+            let quoted = usize::from(price_quoted != 0);
             cents = price(product.add(cut + 1 + quoted), width_tail - cut - 1 - 2 * quoted)?;
             if cents != 0 {
-                let quoted = usize::from(product_quote != 0);
+                let quoted = usize::from(product_quoted != 0);
                 let name = std::slice::from_raw_parts(product.add(quoted), cut - 2 * quoted);
                 category = state.catalog.products.get(state.keys, name).unwrap_or(state.catalog.unknown);
             }

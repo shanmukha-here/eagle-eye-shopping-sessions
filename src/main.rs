@@ -135,14 +135,21 @@ impl Catalog {
 const SIDE: u32 = 1 << 31;
 const ARRIVAL_BIAS: i64 = (SIDE / 2) as i64;
 #[derive(Clone, Copy)]
+struct IdSpan {
+    start: usize,
+    end: usize,
+}
+#[derive(Clone, Copy)]
 struct Detail {
     arrival: i64,
     cents: u32,
     category: u32,
+    opaque: Option<IdSpan>,
 }
 struct Bucket<T> {
     rows: Vec<Candidate<T>>,
     extra: Vec<Detail>,
+    ids: Vec<u8>,
 }
 trait EventTime: Copy + Send {
     fn pack(t: i64, start: i64) -> Self;
@@ -185,6 +192,11 @@ trait EventSink<T: EventTime> {
     fn prefetch_user(&self, _key: Key) {}
 
     fn push(&mut self, row: Candidate<T>, detail: Option<Detail>);
+
+    fn push_opaque(&mut self, mut row: Candidate<T>, detail: Detail, id: &[u8], keys: &Keys) {
+        row.id = mix(keys.key(id));
+        self.push(row, Some(detail));
+    }
 }
 
 impl<T: EventTime> EventSink<T> for [Bucket<T>] {
@@ -197,6 +209,19 @@ impl<T: EventTime> EventSink<T> for [Bucket<T>] {
             bin.extra.push(detail);
         }
         bin.rows.push(row);
+    }
+
+    fn push_opaque(&mut self, mut row: Candidate<T>, mut detail: Detail, id: &[u8], _: &Keys) {
+        const HASH: ahash::RandomState = ahash::RandomState::with_seeds(
+            0x243f6a8885a308d3, 0x13198a2e03707344, 0xa4093822299f31d0, 0x082efa98ec4e6c89,
+        );
+        row.id = HASH.hash_one(id);
+        let bucket = row.id as usize & (self.len() - 1);
+        let ids = &mut self[bucket].ids;
+        let start = ids.len();
+        ids.extend_from_slice(id);
+        detail.opaque = Some(IdSpan { start, end: ids.len() });
+        self.push(row, Some(detail));
     }
 }
 
@@ -220,7 +245,8 @@ fn events<T: EventTime>(
             }
             // mix is a permutation of all 64-bit keys (odd multipliers and
             // reversible XOR shifts). Its full value remains an exact event ID.
-            let id = mix(keys.key(f[0]));
+            let opaque = f[0].len() > 9;
+            let id = if opaque { 0 } else { mix(keys.key(f[0])) };
             let (instant, ingest) = dates.event_times(f[2], f[3]);
             let mut cents = 0;
             let mut category = 0;
@@ -255,12 +281,17 @@ fn events<T: EventTime>(
             let arrival = ingest / 1000;
             let offset = arrival - start / 1000 + ARRIVAL_BIAS;
             candidate.arrival = offset as u32;
-            let detail = (cents != 0 || (offset as u64) >= u64::from(SIDE)).then_some(Detail {
+            let detail = Detail {
                 arrival,
                 cents,
                 category,
-            });
-            partitions.push(candidate, detail);
+                opaque: None,
+            };
+            if opaque {
+                partitions.push_opaque(candidate, detail, f[0], keys);
+            } else {
+                partitions.push(candidate, (cents != 0 || (offset as u64) >= u64::from(SIDE)).then_some(detail));
+            }
         },
     );
 }
@@ -269,6 +300,7 @@ fn events<T: EventTime>(
 struct Routes {
     repeats: IntMap<u64>,
     overflow: IntMap<(i64, u64)>,
+    opaque: hashbrown::HashTable<OpaqueWinner>,
     retired: Vec<u64>,
     seen: Vec<u64>,
     collisions: Vec<u64>,
@@ -297,6 +329,28 @@ impl Routes {
             let (shard, row) = Self::index(handle);
             out[shard].swap_remove(row);
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OpaqueWinner {
+    part: usize,
+    row: usize,
+}
+
+impl OpaqueWinner {
+    fn candidate<T: Copy>(self, parts: &[Bucket<T>]) -> Candidate<T> {
+        parts[self.part].rows[self.row]
+    }
+
+    fn detail<T: Copy>(self, parts: &[Bucket<T>]) -> Detail {
+        let row = self.candidate(parts);
+        parts[self.part].extra[(row.arrival ^ SIDE) as usize]
+    }
+
+    fn id<T: Copy>(self, parts: &[Bucket<T>]) -> &[u8] {
+        let span = self.detail(parts).opaque.unwrap();
+        &parts[self.part].ids[span.start..span.end]
     }
 }
 
@@ -335,13 +389,14 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
     }
     routes.repeats.clear();
     routes.overflow.clear();
+    routes.opaque.clear();
     routes.repeats.reserve(count / 8);
     let shard_mask = out.len() - 1;
     let bias = start / 1000 - ARRIVAL_BIAS;
-    for bin in parts {
-        for block in bin.rows.chunks(group) {
+    for (part, bin) in parts.iter().enumerate() {
+        for (block_number, block) in bin.rows.chunks(group).enumerate() {
             let mut need_alias = people.prefetch_mask(block, |row| row.user);
-            for &row in block {
+            for (within_block, &row) in block.iter().enumerate() {
                 let possible = need_alias & 1 != 0;
                 need_alias >>= 1;
                 let name = || if possible { people.canonical(row.user) } else { row.user };
@@ -355,13 +410,31 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
                 let detail = if side {
                     bin.extra[(row.arrival ^ SIDE) as usize]
                 } else {
-                    Detail { arrival: i64::from(row.arrival) + bias, cents: 0, category: 0 }
+                    Detail { arrival: i64::from(row.arrival) + bias, cents: 0, category: 0, opaque: None }
                 };
                 let route = |u, t| E::encode(Event { u, t, cents: detail.cents, cat: detail.category }, start);
                 if !repeat {
                     if let Some(t) = row.t.unpack(start) {
                         let u = name();
                         out[u as usize & shard_mask].push(route(u, t));
+                    }
+                    continue;
+                }
+                if let Some(span) = detail.opaque {
+                    use hashbrown::hash_table::Entry;
+                    let id = &bin.ids[span.start..span.end];
+                    let candidate = OpaqueWinner { part, row: block_number * group + within_block };
+                    match routes.opaque.entry(
+                        row.id,
+                        |winner| winner.id(&parts) == id,
+                        |winner| winner.candidate(&parts).id,
+                    ) {
+                        Entry::Vacant(entry) => { entry.insert(candidate); }
+                        Entry::Occupied(mut entry) => {
+                            if detail.arrival < entry.get().detail(&parts).arrival {
+                                *entry.get_mut() = candidate;
+                            }
+                        }
                     }
                     continue;
                 }
@@ -416,6 +489,16 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
                     *state = WIDE;
                 }
             }
+        }
+    }
+    for &winner in &routes.opaque {
+        let row = winner.candidate(&parts);
+        if let Some(t) = row.t.unpack(start) {
+            let detail = winner.detail(&parts);
+            let u = people.canonical(row.user);
+            out[u as usize & shard_mask].push(E::encode(
+                Event { u, t, cents: detail.cents, cat: detail.category }, start,
+            ));
         }
     }
 }
@@ -669,6 +752,7 @@ fn pipeline<T: EventTime, E: Stored>(
                         .map(|_| Bucket {
                             rows: Vec::with_capacity(expected),
                             extra: Vec::new(),
+                            ids: Vec::new(),
                         })
                         .collect::<Vec<_>>(),
                     input::ReadBuffer::new(),

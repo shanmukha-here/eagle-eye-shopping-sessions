@@ -520,6 +520,7 @@ fn clicks(
     start: i64,
     end: i64,
     out: &mut Vec<Click>,
+    source: Option<input::ClickSource<'_>>,
 ) {
     rows::<4>(
         data,
@@ -537,7 +538,7 @@ fn clicks(
             out.push(Click {
                 u: mix(keys.key(f[1])),
                 t,
-                id: keys.key(f[0]),
+                id: keys.click_key(f[0], source),
                 campaign,
             });
         },
@@ -651,8 +652,11 @@ fn main() {
             0
         }
     }).sum();
-    let keys = Keys::with_event_bytes(event_bytes);
+    let mut keys = Keys::with_event_bytes(event_bytes);
     let catalog = Catalog::read(&data, &keys);
+    if env::var_os("SHOPPING_DEFER_CLICK_IDS").is_some() {
+        keys.click_input = Some(Input::open_for_scan(&data.join("clicks")));
+    }
     if end.saturating_sub(start) <= u32::MAX as i64
         && catalog.categories.len() <= 256
         && env::var_os("SHOPPING_COMPACT_RECORDS").is_some()
@@ -718,7 +722,9 @@ fn pipeline<T: EventTime, E: Stored>(
     if !probe {
         tasks.push(Scan::Links);
     }
-    let click_input = Input::open_for_scan(&data.join("clicks"));
+    let borrowed_click_ids = keys.click_input.is_some();
+    let local_click_input = (!borrowed_click_ids).then(|| Input::open_for_scan(&data.join("clicks")));
+    let click_input = keys.click_input.as_ref().or(local_click_input.as_ref()).unwrap();
     let early_clicks = env::var_os("SHOPPING_EARLY_CLICKS").is_some();
     let interleave = env::var_os("SHOPPING_INTERLEAVE_CLICKS").is_some();
     let person_shards = n.min(512);
@@ -740,7 +746,7 @@ fn pipeline<T: EventTime, E: Stored>(
     std::thread::scope(|pool_scope| {
         let pool = pool::Pool::new(pool_scope, threads, use_pool);
         let (raw, click_input, keys, catalog, clock, people) =
-            (&raw, &click_input, &keys, &catalog, &clock, &people);
+            (&raw, click_input, &keys, &catalog, &clock, &people);
         let expected = raw.bytes() / 64 / threads / n;
     let lanes = std::thread::scope(|scope| {
         let readers = threads.min(4);
@@ -795,8 +801,13 @@ fn pipeline<T: EventTime, E: Stored>(
                 }
                 Scan::Clicks(chunk) => {
                     let mut pending = Vec::new();
+                    let (bytes, source) = if borrowed_click_ids {
+                        (chunk.records(), Some(chunk.click_source()))
+                    } else {
+                        (chunk.read(&mut s.2), None)
+                    };
                     raw::clicks(
-                        chunk.read(&mut s.2),
+                        bytes,
                         &mut s.0,
                         &keys,
                         &catalog,
@@ -804,6 +815,7 @@ fn pipeline<T: EventTime, E: Stored>(
                         start,
                         end,
                         &mut pending,
+                        source,
                         raw_aux,
                     );
                     if early_clicks {
@@ -857,7 +869,9 @@ fn pipeline<T: EventTime, E: Stored>(
     // reduce events, so the main thread need not unmap gigabytes at a barrier.
     let release_inputs = pool_scope.spawn(move || {
         raw.release_pages();
-        click_input.release_pages();
+        if !borrowed_click_ids {
+            click_input.release_pages();
+        }
     });
     if early_clicks && env::var_os("SHOPPING_PHASE_USAGE").is_some() {
         eprintln!("clicks routed in parse={earlier}");

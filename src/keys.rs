@@ -9,6 +9,7 @@ use std::{
 pub type Key = u64;
 const EXTERNAL: u64 = 1 << 63;
 const OVERFLOW: u64 = 1 << 62;
+const CLICK_INPUT: u64 = 1 << 61;
 const LOW: u64 = 0x7f7f7f7f7f7f7f7f;
 
 // The ninth byte occupies the unused high bits of the last seven ASCII bytes.
@@ -71,6 +72,7 @@ const SHARDS: usize = 1 << SHARD_BITS;
 pub struct Keys {
     table: crate::opaque_names::Table,
     overflow: [Mutex<Long>; SHARDS],
+    pub(super) click_input: Option<crate::input::Input>,
 }
 
 impl Default for Keys {
@@ -85,13 +87,19 @@ impl Keys {
         Self {
             table: crate::opaque_names::Table::with_capacity(slots),
             overflow: Default::default(),
+            click_input: None,
         }
     }
 
     #[inline]
     fn resident(&self, key: Key) -> Option<&[u8]> {
-        ((key & (EXTERNAL | OVERFLOW)) == EXTERNAL)
-            .then(|| self.table.get((key ^ EXTERNAL) as usize))
+        match key & (EXTERNAL | OVERFLOW | CLICK_INPUT) {
+            EXTERNAL => Some(self.table.get((key ^ EXTERNAL) as usize)),
+            bits if bits == EXTERNAL | CLICK_INPUT => {
+                Some(self.click_input.as_ref().unwrap().click_name(key ^ bits))
+            }
+            _ => None,
+        }
     }
 
 
@@ -120,6 +128,16 @@ impl Keys {
         }
         self.intern(s)
     }
+    #[inline]
+    pub(crate) fn click_key(&self, id: &[u8], source: Option<crate::input::ClickSource<'_>>) -> Key {
+        if id.len() > 9 {
+            if let Some(handle) = source.and_then(|source| source.name_handle(id)) {
+                return EXTERNAL | CLICK_INPUT | handle;
+            }
+        }
+        self.key(id)
+    }
+
     #[cold]
     #[inline(never)]
     fn intern(&self, s: &[u8]) -> Key {
@@ -493,6 +511,7 @@ mod tests {
         let keys = Keys {
             table: crate::opaque_names::Table::with_capacity(1),
             overflow: Default::default(),
+            click_input: None,
         };
         let a = b"same-opaque-prefix-for-resident-name";
         let b = b"same-opaque-prefix-for-overflow-name";

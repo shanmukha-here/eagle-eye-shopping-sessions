@@ -240,11 +240,19 @@ impl Input {
         }
     }
 
+    pub(crate) fn click_name(&self, handle: u64) -> &[u8] {
+        let file = (handle >> 48) as usize;
+        let offset = ((handle >> 16) as u32) as usize;
+        let length = (handle as u16) as usize;
+        &self.files[file].mapping[offset..offset + length]
+    }
+
     pub fn chunks(&self) -> Vec<Chunk<'_>> {
-        let mut chunks: Vec<_> = self.files.iter().flat_map(|source| {
+        let mut chunks: Vec<_> = self.files.iter().enumerate().flat_map(|(file_index, source)| {
             let file = &source.mapping;
-            (0..file.len()).step_by(self.step).map(|start| Chunk {
+            (0..file.len()).step_by(self.step).map(move |start| Chunk {
                 file,
+                file_index,
                 buffered: source.buffered.as_ref(),
                 start,
                 populate: self.populate_chunks,
@@ -267,12 +275,17 @@ impl Input {
 #[derive(Clone, Copy)]
 pub struct Chunk<'a> {
     file: &'a [u8],
+    file_index: usize,
     buffered: Option<&'a File>,
     start: usize,
     end: usize,
     populate: bool,
 }
 impl<'a> Chunk<'a> {
+    pub(crate) fn click_source(&self) -> ClickSource<'a> {
+        ClickSource { file: self.file, index: self.file_index }
+    }
+
     pub fn read<'b>(&'b self, buf: &'b mut ReadBuffer) -> &'b [u8] {
         use std::os::unix::fs::FileExt;
         if let Some(fd) = self.buffered {
@@ -302,6 +315,29 @@ impl<'a> Chunk<'a> {
             }
         }
         owned_records(&self.file[self.start..], self.end - self.start, true).unwrap()
+    }
+}
+
+/// Exact reference to a name in immutable mapped input. Any unrepresentable
+/// source or field falls back to ordinary string interning.
+#[derive(Clone, Copy)]
+pub(crate) struct ClickSource<'a> {
+    file: &'a [u8],
+    index: usize,
+}
+
+impl ClickSource<'_> {
+    pub(crate) fn name_handle(self, name: &[u8]) -> Option<u64> {
+        let offset = name.as_ptr().addr().checked_sub(self.file.as_ptr().addr())?;
+        let length = name.len();
+        if length > u16::MAX as usize
+            || offset > u32::MAX as usize
+            || self.index >= 1 << 13
+            || offset.checked_add(length)? > self.file.len()
+        {
+            return None;
+        }
+        Some((self.index as u64) << 48 | (offset as u64) << 16 | length as u64)
     }
 }
 

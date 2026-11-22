@@ -841,6 +841,7 @@ pub(crate) fn pipeline(
                         start,
                         end,
                         temporary,
+                        None,
                         fast,
                     );
                     for click in temporary.drain(..) {

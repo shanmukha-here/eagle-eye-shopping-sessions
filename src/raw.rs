@@ -932,12 +932,13 @@ unsafe fn click(
     keys: &Keys,
     catalog: &Catalog,
     out: &mut Vec<Click>,
+    source: Option<crate::input::ClickSource<'_>>,
 ) -> bool {
     unsafe {
         let (mut id, mut user) = (0, 0);
         let campaign = two_ids::<true, true>(p, b',', &mut id, &mut user);
         if campaign.is_null() {
-            return click_opaque_tail(p, end, limit, state, keys, catalog, out);
+            return click_opaque_tail(p, end, limit, state, keys, catalog, out, source);
         }
         let Some((time, code)) = click_tail(campaign, end, state, catalog) else {
             return false;
@@ -963,6 +964,7 @@ unsafe fn click_opaque_tail(
     keys: &Keys,
     catalog: &Catalog,
     out: &mut Vec<Click>,
+    source: Option<crate::input::ClickSource<'_>>,
 ) -> bool {
     unsafe {
         let Some((id, next)) = read_opaque_id(p, limit) else { return false; };
@@ -974,7 +976,7 @@ unsafe fn click_opaque_tail(
             out.push(Click {
                 u: mix(keys.key(user)),
                 t: time,
-                id: keys.key(id),
+                id: keys.click_key(id, source),
                 campaign: code,
             });
         }
@@ -991,13 +993,14 @@ pub(super) fn clicks(
     start: i64,
     end: i64,
     out: &mut Vec<Click>,
+    source: Option<crate::input::ClickSource<'_>>,
     fast: bool,
 ) {
     if fast {
         // The caller selected AVX2 before enabling this scanner.
-        unsafe { click_loop(data, date, keys, catalog, State { start, end, clock }, out) }
+        unsafe { click_loop(data, date, keys, catalog, State { start, end, clock }, out, source) }
     } else {
-        crate::clicks(data, date, keys, catalog, start, end, out);
+        crate::clicks(data, date, keys, catalog, start, end, out, source);
     }
 }
 
@@ -1009,6 +1012,7 @@ unsafe fn click_loop(
     catalog: &Catalog,
     state: State<'_>,
     out: &mut Vec<Click>,
+    source: Option<crate::input::ClickSource<'_>>,
 ) {
     unsafe {
         let limit = data.as_ptr().add(data.len());
@@ -1018,10 +1022,10 @@ unsafe fn click_loop(
             let next = end.add(usize::from(end < limit));
             if limit.offset_from(p) < 128
                 || end.offset_from(p) < 32
-                || !click(p, end, limit, state, keys, catalog, out)
+                || !click(p, end, limit, state, keys, catalog, out, source)
             {
                 let row = std::slice::from_raw_parts(p, next.offset_from(p) as usize);
-                crate::clicks(row, date, keys, catalog, state.start, state.end, out);
+                crate::clicks(row, date, keys, catalog, state.start, state.end, out, source);
             }
             p = next;
         }

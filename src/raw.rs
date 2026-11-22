@@ -558,14 +558,37 @@ unsafe fn bounded_key(p: Ptr, len: usize) -> (u64, bool) {
 unsafe fn id_pair(p: Ptr) -> (u64, u64, Ptr) {
     unsafe {
         let commas = _mm256_set1_epi8(b',' as i8);
-        let head = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(p.cast()), commas)) as u32;
-        let first = head.trailing_zeros() as usize;
+        let bytes = _mm256_loadu_si256(p.cast());
+        let head = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, commas)) as u32;
+        let first = head.trailing_zeros();
         let rest = head & head.wrapping_sub(1);
-        let second = rest.trailing_zeros() as usize;
-        let framed = second < 32;
-        let (a, a_ok) = bounded_key(p, first);
-        let (b, b_ok) = bounded_key(p.add(first + 1), if framed { second - first - 1 } else { 0 });
-        (a, b, if framed & a_ok & b_ok { p.add(second + 1) } else { std::ptr::null() })
+        let second = rest.trailing_zeros();
+        // Bytes from '0' to 127, the only ones an ID may contain.
+        let ordinary = _mm256_movemask_epi8(_mm256_cmpgt_epi8(bytes, _mm256_set1_epi8(b'/' as i8))) as u32;
+        let quotes = _mm256_movemask_epi8(_mm256_cmpeq_epi8(bytes, _mm256_set1_epi8(b'"' as i8))) as u32;
+        let left = first.wrapping_add(1);
+        let q1 = quotes & 1;
+        let q2 = quotes.wrapping_shr(left) & 1;
+        let w1 = first.wrapping_sub(2 * q1);
+        let w2 = second.wrapping_sub(left).wrapping_sub(2 * q2);
+        let s1 = q1;
+        let s2 = left.wrapping_add(q2);
+        let span = |width: u32, at: u32| (1u32.wrapping_shl(width).wrapping_sub(1)).wrapping_shl(at);
+        let need = span(w1, s1) | span(w2, s2);
+        // Content bytes are ordinary, so a quoted field has only its two
+        // quotes; the closing ones remain to be proved.
+        let closers = q1.wrapping_shl(first.wrapping_sub(1)) | q2.wrapping_shl(second.wrapping_sub(1));
+        let ok = (second < 32)
+            & (w1.wrapping_sub(8) <= 1)
+            & (w2.wrapping_sub(8) <= 1)
+            & (ordinary & need == need)
+            & (quotes & closers == closers);
+        let key = |at: u32, width: u32| {
+            let v = p.add(at as usize & 31);
+            let ninth = if width == 9 { v.add(8).read() } else { 0 };
+            word(v).swap_bytes() | pack_ninth(ninth & 127)
+        };
+        (key(s1, w1), key(s2, w2), if ok { p.add(second as usize + 1) } else { std::ptr::null() })
     }
 }
 

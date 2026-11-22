@@ -320,6 +320,24 @@ impl People {
 // Nonempty keys use zero as the empty slot sentinel. The parent stores a
 // slot index plus one, with zero identifying a root. Entries never move.
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed};
+/// `n` values from zeroed allocator memory. Fresh pages arrive zero-filled
+/// on first touch, so no thread writes the defaults in a serial pass.
+///
+/// # Safety
+/// The all-zero bit pattern must be a valid `T`.
+unsafe fn zeroed<T>(n: usize) -> Vec<T> {
+    let n = n.max(1);
+    let layout = std::alloc::Layout::array::<T>(n).unwrap();
+    unsafe {
+        let ptr = std::alloc::alloc_zeroed(layout).cast::<T>();
+        if ptr.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        // The global allocator returned this block for exactly this layout.
+        Vec::from_raw_parts(ptr, n, n)
+    }
+}
+
 #[derive(Default)]
 struct Vertex {
     key: AtomicU64,
@@ -328,11 +346,8 @@ struct Vertex {
 pub struct Graph(Vec<Vertex>);
 impl Graph {
     pub fn with_capacity(slots: usize) -> Self {
-        Self(
-            (0..slots.max(16).next_power_of_two())
-                .map(|_| Vertex::default())
-                .collect(),
-        )
+        // Vertex::default() is all zero bits.
+        Self(unsafe { zeroed(slots.max(16).next_power_of_two()) })
     }
     /// Start loading the first slot `join` probes for this key.
     #[inline(always)]
@@ -455,11 +470,10 @@ pub struct Aliases {
 impl Aliases {
     fn empty(n: usize) -> Self {
         let length = if std::env::var_os("SHOPPING_ALIAS_FILTER").is_some() { n } else { 0 };
+        // Zero atomics are the empty filter and empty slots.
         Self {
-            homes: (0..length).map(|_| AtomicU8::new(0)).collect(),
-            table: (0..n)
-                .map(|_| (AtomicU64::new(0), AtomicU64::new(0)))
-                .collect(),
+            homes: if length == 0 { Vec::new() } else { unsafe { zeroed(length) } },
+            table: unsafe { zeroed(n) },
         }
     }
     #[inline(always)]

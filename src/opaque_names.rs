@@ -43,6 +43,22 @@ impl Name {
     }
 }
 
+/// Byte equality with an inline path for the 33-byte generated IDs, which
+/// would otherwise pay a library call per confirmed match.
+#[inline(always)]
+pub(super) fn same(a: &[u8], b: &[u8]) -> bool {
+    if a.len() == 33 && b.len() == 33 {
+        let word = |s: &[u8], i: usize| u64::from_le_bytes(s[8 * i..8 * i + 8].try_into().unwrap());
+        return ((word(a, 0) ^ word(b, 0))
+            | (word(a, 1) ^ word(b, 1))
+            | (word(a, 2) ^ word(b, 2))
+            | (word(a, 3) ^ word(b, 3))
+            | u64::from(a[32] ^ b[32]))
+            == 0;
+    }
+    a == b
+}
+
 pub(super) struct Table {
     _mapping: MmapMut,
     start: NonNull<AtomicPtr<Name>>,
@@ -155,7 +171,7 @@ impl Table {
             // Acquire above pairs with publication. The table retains the
             // initialized object until its last borrower has gone away.
             let existing = unsafe { &*current };
-            if existing.hash == hash && existing.bytes() == bytes {
+            if existing.hash == hash && same(existing.bytes(), bytes) {
                 return Some(at);
             }
             at = (at + 1) & mask;

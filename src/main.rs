@@ -202,23 +202,41 @@ struct Catalog {
 }
 impl Catalog {
     fn read(data: &Path, keys: &Keys) -> Self {
+        // Products take a provisional category number in first-seen order;
+        // after the read, numbers map to positions in the sorted names.
+        let input = Input::open(&data.join("products.csv"));
+        let lines = input.chunks().iter().map(|chunk| chunk.records().iter().filter(|&&c| c == b'\n').count() + 1).sum();
+        let mut products = Numbered::new(b"p", lines);
+        let mut seen = std::collections::HashMap::<Vec<u8>, u32, _>::with_hasher(ahash::RandomState::with_seeds(1, 2, 3, 4));
         let mut names = vec![b"unknown".to_vec()];
-        let mut pairs = Vec::new();
-        for chunk in Input::open(&data.join("products.csv")).chunks() {
+        seen.insert(b"unknown".to_vec(), 0);
+        for chunk in input.chunks() {
             rows::<2>(chunk.records(), |v| {
-                names.push(v[1].to_vec());
-                pairs.push((v[0].to_vec(), v[1].to_vec()));
+                let category = match seen.get(v[1]) {
+                    Some(&number) => number,
+                    None => {
+                        let number = names.len() as u32;
+                        names.push(v[1].to_vec());
+                        seen.insert(v[1].to_vec(), number);
+                        number
+                    }
+                };
+                products.insert(keys, v[0], category);
             });
         }
-        names.sort_unstable();
-        names.dedup();
-        let unknown = names
-            .binary_search_by(|s| s.as_slice().cmp(b"unknown"))
-            .unwrap() as u32;
-        let mut products = Numbered::new(b"p", pairs.len());
-        for (id, category) in pairs {
-            products.insert(keys, &id, names.binary_search(&category).unwrap() as u32);
+        let mut order: Vec<u32> = (0..names.len() as u32).collect();
+        order.sort_unstable_by(|&a, &b| names[a as usize].cmp(&names[b as usize]));
+        let mut position = vec![0; names.len()];
+        for (at, &number) in order.iter().enumerate() {
+            position[number as usize] = at as u32;
         }
+        for value in products.values.iter_mut().chain(products.other.values_mut()) {
+            if *value != u32::MAX {
+                *value = position[*value as usize];
+            }
+        }
+        let unknown = position[0];
+        let names: Vec<Vec<u8>> = order.iter().map(|&number| std::mem::take(&mut names[number as usize])).collect();
         let mut campaign_pairs = Vec::new();
         let mut channels = vec![(ByteArray::from("organic"), ByteArray::from("organic"))];
         for chunk in Input::open(&data.join("campaigns.csv")).chunks() {
@@ -668,7 +686,7 @@ fn winners<T: EventTime, E: Stored, const PAIRED_BITS: bool>(
                     let candidate = OpaqueWinner { part, row: block_number * group + within_block };
                     match routes.opaque.entry(
                         row.id,
-                        |winner| winner.id(&parts, source) == id,
+                        |winner| crate::opaque_names::same(winner.id(&parts, source), id),
                         |winner| winner.candidate(&parts).id,
                     ) {
                         Entry::Vacant(entry) => { entry.insert(candidate); }

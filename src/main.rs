@@ -475,6 +475,28 @@ struct EventStore<'a, T> {
     last_bin: usize,
     pending: Vec<PendingUser>,
     exact_long: bool,
+    // Dense heads of the buckets' check-hash vectors, as for the rows.
+    long_heads: Vec<LongHead>,
+}
+
+struct LongHead {
+    checks: *mut u64,
+    len: u32,
+    cap: u32,
+    marks: *mut u64,
+    words: usize,
+}
+
+impl LongHead {
+    fn of<T>(bin: &mut Bucket<T>) -> Self {
+        Self {
+            checks: bin.long.as_mut_ptr(),
+            len: u32::try_from(bin.long.len()).unwrap(),
+            cap: u32::try_from(bin.long.capacity()).unwrap_or(u32::MAX),
+            marks: bin.long_rows.as_mut_ptr(),
+            words: bin.long_rows.len(),
+        }
+    }
 }
 
 impl<'a, T> EventStore<'a, T> {
@@ -482,7 +504,22 @@ impl<'a, T> EventStore<'a, T> {
         assert!(bins.len().is_power_of_two());
         let heads = bins.iter_mut().map(|bin| RowHead::of(&mut bin.rows)).collect();
         let exact_long = EXACT_LONG_IDS.load(std::sync::atomic::Ordering::Relaxed);
-        Self { mask: bins.len() - 1, bins, heads, source, keys, last_bin: 0, pending: Vec::with_capacity(USER_BATCH), exact_long }
+        let long_heads = bins.iter_mut().map(|bin| LongHead::of(bin)).collect();
+        Self { mask: bins.len() - 1, bins, heads, source, keys, last_bin: 0, pending: Vec::with_capacity(USER_BATCH), exact_long, long_heads }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow_long(&mut self, index: usize, check: u64, row: u32) {
+        let bin = &mut self.bins[index];
+        unsafe { bin.long.set_len(self.long_heads[index].len as usize) };
+        bin.long.push(check);
+        let word = row as usize / 64;
+        if word >= bin.long_rows.len() {
+            bin.long_rows.resize((word + 1).max(bin.long_rows.len() * 2), 0);
+        }
+        bin.long_rows[word] |= 1 << (row % 64);
+        self.long_heads[index] = LongHead::of(bin);
     }
 
     #[cold]
@@ -519,9 +556,10 @@ impl<T> Drop for EventStore<'_, T> {
         if !self.pending.is_empty() {
             self.resolve_users();
         }
-        for (bin, head) in self.bins.iter_mut().zip(&self.heads) {
+        for ((bin, head), long) in self.bins.iter_mut().zip(&self.heads).zip(&self.long_heads) {
             // The store wrote every row below the head's length in place.
             unsafe { bin.rows.set_len(head.len as usize) };
+            unsafe { bin.long.set_len(long.len as usize) };
         }
     }
 }
@@ -591,13 +629,18 @@ impl<T: EventTime> EventSink<T> for EventStore<'_, T> {
             row.id = mix(long_key(crate::opaque_names::hash(id)));
             let index = row.id as usize & self.mask;
             let at = self.heads[index].len;
-            let bin = self.bucket(row.id);
-            bin.long.push(crate::opaque_names::check_hash(id));
+            let check = crate::opaque_names::check_hash(id);
+            let head = unsafe { self.long_heads.get_unchecked_mut(index) };
             let word = at as usize / 64;
-            if word >= bin.long_rows.len() {
-                bin.long_rows.resize((word + 1).max(bin.long_rows.len() * 2), 0);
+            if head.len == head.cap || word >= head.words {
+                self.grow_long(index, check, at);
+            } else {
+                unsafe {
+                    head.checks.add(head.len as usize).write(check);
+                    *head.marks.add(word) |= 1 << (at % 64);
+                }
+                head.len += 1;
             }
-            bin.long_rows[word] |= 1 << (at % 64);
             // Without a sale or an outlying clock the arrival stays inline,
             // as for short IDs.
             let side = detail.cents != 0 || row.arrival & SIDE != 0;

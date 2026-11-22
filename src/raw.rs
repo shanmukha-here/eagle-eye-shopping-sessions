@@ -373,6 +373,8 @@ struct State<'a> {
     clock: &'a Calendar,
     start: i64,
     end: i64,
+    // ARRIVAL_BIAS - start / 1000, the per-row offset base.
+    bias: i64,
     catalog: &'a Catalog,
     keys: &'a Keys,
 }
@@ -413,7 +415,7 @@ unsafe fn decode_event<const LEVEL: usize, T: EventTime>(
         if !view_tail(tail, end) {
             return false;
         }
-        let offset = arrival / 1000 - state.start / 1000 + ARRIVAL_BIAS;
+        let offset = arrival / 1000 + state.bias;
         if (offset as u64) >= u64::from(SIDE) {
             return false;
         }
@@ -820,7 +822,7 @@ unsafe fn event_tail_body<const PURCHASE: bool>(clock: Ptr, limit: Ptr, state: S
             let zone = if width == 25 { offset_millis(ts)? } else { 0 };
             (event_day + event_clock + zone, day + arrival_clock)
         };
-        let offset = arrived / 1000 - state.start / 1000 + ARRIVAL_BIAS;
+        let offset = arrived / 1000 + state.bias;
         if offset as u64 >= u64::from(SIDE) {
             return None;
         }
@@ -1012,7 +1014,7 @@ pub(super) fn events<T: EventTime>(
     level: usize,
     count_rows: bool,
 ) -> [usize; 2] {
-    let state = State { clock, start, end, catalog, keys };
+    let state = State { clock, start, end, bias: ARRIVAL_BIAS - start / 1000, catalog, keys };
     // The caller has checked AVX2. Keep the probe checkpoints consistent.
     unsafe {
         if level == 7 {
@@ -1226,7 +1228,7 @@ pub(super) fn clicks(
 ) {
     if fast {
         // The caller selected AVX2 before enabling this scanner.
-        unsafe { click_loop(data, date, keys, catalog, State { start, end, clock, catalog, keys }, out, source) }
+        unsafe { click_loop(data, date, keys, catalog, State { start, end, bias: ARRIVAL_BIAS - start / 1000, clock, catalog, keys }, out, source) }
     } else {
         crate::clicks(data, date, keys, catalog, start, end, out, source);
     }

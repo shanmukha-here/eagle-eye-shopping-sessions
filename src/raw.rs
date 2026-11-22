@@ -550,6 +550,25 @@ unsafe fn bounded_key(p: Ptr, len: usize) -> (u64, bool) {
     }
 }
 
+/// Frame the two leading ID fields from the comma mask of the first 32
+/// bytes. Plain and quoted IDs of eight or nine bytes take one path; any
+/// other row returns a null cursor for the slower readers. At least 128
+/// readable bytes follow `p`.
+#[inline(always)]
+unsafe fn id_pair(p: Ptr) -> (u64, u64, Ptr) {
+    unsafe {
+        let commas = _mm256_set1_epi8(b',' as i8);
+        let head = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(p.cast()), commas)) as u32;
+        let first = head.trailing_zeros() as usize;
+        let rest = head & head.wrapping_sub(1);
+        let second = rest.trailing_zeros() as usize;
+        let framed = second < 32;
+        let (a, a_ok) = bounded_key(p, first);
+        let (b, b_ok) = bounded_key(p.add(first + 1), if framed { second - first - 1 } else { 0 });
+        (a, b, if framed & a_ok & b_ok { p.add(second + 1) } else { std::ptr::null() })
+    }
+}
+
 #[inline(always)]
 unsafe fn event_prefix<T: EventTime>(
     p: Ptr,
@@ -613,19 +632,10 @@ unsafe fn event_tail_scan<T: EventTime>(
         if limit.offset_from(p) < 128 {
             return std::ptr::null();
         }
-        // Frame both IDs from the comma mask. A quoted or eight-byte ID
-        // takes the same path as a plain nine-byte one.
-        let commas = _mm256_set1_epi8(b',' as i8);
-        let head = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(p.cast()), commas)) as u32;
-        let first = head.trailing_zeros() as usize;
-        let rest = head & head.wrapping_sub(1);
-        let second = rest.trailing_zeros() as usize;
-        let (id, id_ok) = bounded_key(p, first);
-        let (user, user_ok) = bounded_key(p.add(first + 1), second.wrapping_sub(first + 1));
-        if !((second < 32) & id_ok & user_ok) {
+        let (id, user, clock) = id_pair(p);
+        if clock.is_null() {
             return event_opaque_tail(p, limit, state, keys, emit);
         }
-        let clock = p.add(second + 1);
         let Some(tail) = checked_event_tail(clock, limit, state) else {
             return std::ptr::null();
         };
@@ -1089,8 +1099,7 @@ unsafe fn click(
     users: &mut LongUsers,
 ) -> bool {
     unsafe {
-        let (mut id, mut user) = (0, 0);
-        let campaign = two_ids::<true, true>(p, b',', &mut id, &mut user);
+        let (id, user, campaign) = id_pair(p);
         if campaign.is_null() {
             return click_opaque_tail(p, end, limit, state, keys, catalog, out, source, users);
         }
@@ -1243,8 +1252,16 @@ unsafe fn link_loop(data: &[u8], keys: &Keys, pair: &mut impl FnMut(u64, u64)) {
             let end = next_lf(p, limit);
             let next = end.add(usize::from(end < limit));
             if limit.offset_from(p) >= 128 && end.offset_from(p) >= 17 {
-                let (mut a, mut b) = (0, 0);
-                if two_ids::<true, true>(p, b'\n', &mut a, &mut b) == next {
+                // Frame the first field from the comma mask; the second runs
+                // to the LF. Field proofs reject commas and quotes inside.
+                let commas = _mm256_set1_epi8(b',' as i8);
+                let head = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_loadu_si256(p.cast()), commas)) as u32;
+                let first = head.trailing_zeros() as usize;
+                let width = end.offset_from(p) as usize;
+                let framed = (first < 32) & (width <= 32);
+                let (a, a_ok) = bounded_key(p, first);
+                let (b, b_ok) = bounded_key(p.add(first + 1), if framed { width - first - 1 } else { 0 });
+                if framed & a_ok & b_ok {
                     pair(a, b);
                     p = next;
                     continue;

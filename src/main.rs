@@ -1214,10 +1214,41 @@ impl Layout {
     }
 
     fn reserve<T>(self) -> (Vec<Bucket<T>>, Vec<Vec<Click>>) {
+        let share = populate_share();
         let buckets = (0..self.buckets)
-            .map(|_| Bucket { rows: Vec::with_capacity(self.rows), extra: Vec::with_capacity(self.rows / EXTRA_SHARE), ids: Vec::new(), wide: Vec::new() })
+            .map(|_| {
+                let bucket = Bucket { rows: Vec::with_capacity(self.rows), extra: Vec::with_capacity(self.rows / EXTRA_SHARE), ids: Vec::new(), wide: Vec::new() };
+                populate(&bucket.rows, share);
+                populate(&bucket.extra, share);
+                bucket
+            })
             .collect();
-        (buckets, reserved::<Click>(self.shards, self.clicks))
+        let clicks = reserved::<Click>(self.shards, self.clicks);
+        if env::var_os("SHOPPING_POPULATE_CLICKS").is_some() {
+            clicks.iter().for_each(|shard| populate(shard, share));
+        }
+        (buckets, clicks)
+    }
+}
+
+/// Percent of each parse reservation to fault in on the helper threads.
+/// Without huge pages, demand faults on 4 KiB pages interrupt the parse
+/// lanes; generated rows fill about two thirds of the reservations.
+fn populate_share() -> usize {
+    env::var("SHOPPING_POPULATE_ROWS").ok().and_then(|v| v.parse().ok()).unwrap_or(
+        if input::TIGHT_MEMORY.load(std::sync::atomic::Ordering::Relaxed) { 70 } else { 0 },
+    )
+}
+
+fn populate<T>(v: &Vec<T>, percent: usize) {
+    let bytes = v.capacity() * size_of::<T>() * percent / 100;
+    let start = v.as_ptr() as usize;
+    let first = (start + 4095) & !4095;
+    let end = (start + bytes) & !4095;
+    if end > first {
+        // Advice only: a kernel without MADV_POPULATE_WRITE leaves the
+        // pages to fault on first use as before.
+        unsafe { libc::madvise(first as *mut libc::c_void, end - first, libc::MADV_POPULATE_WRITE) };
     }
 }
 
